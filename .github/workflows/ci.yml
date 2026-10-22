@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: tests (${{ matrix.renode }})
+    runs-on: ubuntu-24.04
+    # The pinned release decides the result; the nightly build (Renode master) is informational.
+    continue-on-error: ${{ matrix.renode == 'nightly' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        renode: [release, nightly]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select the Renode build
+        run: |
+          if [ "${{ matrix.renode }}" = "release" ]; then
+            echo "RENODE_ARCHIVE=renode-1.17.0.linux-portable.tar.gz" >> "$GITHUB_ENV"
+          else
+            echo "RENODE_ARCHIVE=renode-latest.linux-portable.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download Renode
+        run: |
+          mkdir renode-portable
+          curl -sSfL "https://builds.renode.io/${RENODE_ARCHIVE}" \
+            | tar xz --strip-components=1 -C renode-portable
+          renode-portable/renode --version | head -1
+
+      - name: Install test requirements
+        run: pip install -r renode-portable/tests/requirements.txt
+
+      - name: Install ARM GCC
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi libnewlib-arm-none-eabi cmake ninja-build
+
+      - name: Build test firmware
+        run: |
+          arm-none-eabi-gcc --version | head -1
+          cmake -S firmware-tests -B build/firmware -G Ninja
+          cmake --build build/firmware
+
+      - name: Run tests
+        run: |
+          renode-portable/renode-test --results-dir build/test-results $(find tests -name '*.robot' | sort)
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.renode }}
+          path: build/test-results

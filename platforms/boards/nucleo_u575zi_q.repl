@@ -1,0 +1,25 @@
+// NUCLEO-U575ZI-Q (STM32U575ZIT6Q). Only the user LEDs and the user button are described.
+//
+// Pins and polarity: STM32CubeU5 v1.9.0 Nucleo BSP (stm32u5xx-nucleo-bsp v1.2.3),
+// stm32u5xx_nucleo.h with USE_NUCLEO_144: LED1 (green) PC7, LED2 (blue) PB7, LED3 (red) PG2,
+// switched on by driving the pin high (BSP_LED_On); BUTTON_USER PC13, configured with a
+// pull-down and read as high when pressed (BSP_PB_Init, BUTTON_PRESSED = 1).
+using "../cpus/stm32u575.repl"
+
+led1: Miscellaneous.LED @ gpioPortC
+
+led2: Miscellaneous.LED @ gpioPortB
+
+led3: Miscellaneous.LED @ gpioPortG
+
+gpioPortC:
+    7 -> led1@0
+
+gpioPortB:
+    7 -> led2@0
+
+gpioPortG:
+    2 -> led3@0
+
+userButton: Miscellaneous.Button @ gpioPortC
+    -> gpioPortC@13

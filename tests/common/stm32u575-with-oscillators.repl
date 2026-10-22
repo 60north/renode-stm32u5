@@ -1,0 +1,7 @@
+// Test fixture only: STM32U575 with external oscillators present. The frequencies are
+// arbitrary values inside the documented ranges and do not describe a particular board.
+using "../../platforms/cpus/stm32u575.repl"
+
+rcc:
+    hseFrequency: 16000000
+    lseFrequency: 32768

@@ -1,0 +1,14 @@
+// Test fixture only: an LED on PA5 and buttons on PC13 and PB13 of an STM32U575. The pins
+// are arbitrary and do not describe a particular board.
+using "../../platforms/cpus/stm32u575.repl"
+
+led: Miscellaneous.LED @ gpioPortA
+
+gpioPortA:
+    5 -> led@0
+
+buttonC13: Miscellaneous.Button @ gpioPortC
+    -> gpioPortC@13
+
+buttonB13: Miscellaneous.Button @ gpioPortB
+    -> gpioPortB@13

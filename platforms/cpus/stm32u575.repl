@@ -1,0 +1,225 @@
+// STM32U575 (Arm Cortex-M33). Memory sizes describe the STM32U575xI parts (2 MB flash).
+//
+// Sources: RM0456 Rev 7, DS13737 Rev 10, cmsis-device-u5 v1.4.3 stm32u575xx.h.
+// Addresses are the non-secure aliases; TrustZone (TZEN = 1) is not modelled.
+// Requires the models compiled by scripts/load-models.resc.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m33"
+    nvic: nvic
+    // TZEN = 0, BOOT0 = 0: boot from NSBOOTADD0, ST default 0x0800 0000
+    // (RM0456 section 4, Table 25, p.192).
+    InitVectorTableOffset: 0x08000000
+
+// __NVIC_PRIO_BITS = 4 (stm32u575xx.h). After reset SYSCLK is MSIS range 4, about 4 MHz
+// (RM0456 section 11.8.2, RCC_ICSCR1 reset value, p.516); RCC updates the SysTick clock.
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    systickFrequency: 4000000
+    IRQ -> cpu@0
+
+// Memories (stm32u575xx.h *_BASE_NS and *_SIZE; RM0456 section 2.3).
+flash: Memory.MappedMemory @ sysbus 0x08000000
+    size: 0x200000
+
+sram1: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x30000
+
+sram2: Memory.MappedMemory @ sysbus 0x20030000
+    size: 0x10000
+
+sram3: Memory.MappedMemory @ sysbus 0x20040000
+    size: 0x80000
+
+sram4: Memory.MappedMemory @ sysbus 0x28000000
+    size: 0x4000
+
+// 0x4003 6400 - 0x4003 6BFF (RM0456 memory map).
+bkpsram: Memory.MappedMemory @ sysbus 0x40036400
+    size: 0x800
+
+// OTP area, FLASH_OTP_BASE and FLASH_OTP_SIZE (stm32u575xx.h). ArrayMemory because
+// MappedMemory must be aligned to the 0x400 guest page size; these areas hold data only.
+otp: Memory.ArrayMemory @ sysbus 0x0BFA0000
+    size: 0x200
+
+// Package data (0x0BFA0500), unique device ID (0x0BFA0700) and flash size data
+// (0x0BFA07A0) (stm32u575xx.h PACKAGE_BASE, UID_BASE, FLASHSIZE_BASE). The flash size value
+// is factory programmed (RM0456 section 76); 0x0800 = 2048 KB for the "I" flash code
+// (DS13737 ordering information, p.338). The package and UID words are left at zero.
+deviceInformation: Memory.ArrayMemory @ sysbus 0x0BFA0500
+    size: 0x300
+
+sysbus:
+    init:
+        WriteWord 0x0BFA07A0 0x0800
+
+// Peripheral base addresses: stm32u575xx.h *_BASE_NS; interrupt numbers: IRQn_Type.
+pwr: Miscellaneous.STM32U5_PWR @ sysbus 0x46020800
+
+// HSE and LSE are board components: set hseFrequency/lseFrequency in the board description.
+rcc: Miscellaneous.STM32U5_RCC @ sysbus 0x46020C00
+    nvic: nvic
+    pwr: pwr
+    usart1: usart1
+    usart2: usart2
+    usart3: usart3
+    uart4: uart4
+    uart5: uart5
+    lpuart1: lpuart1
+    IRQ -> nvic@9
+
+flashController: MTD.STM32U5_FlashController @ sysbus 0x40022000
+    flash: flash
+    IRQ -> nvic@6
+
+icache: Miscellaneous.STM32U5_ICACHE @ sysbus 0x40030400
+    IRQ -> nvic@107
+
+// All 24 EXTI lines are configurable (RM0456 Table 189). Lines 0-15 -> EXTI0..EXTI15_IRQn.
+exti: IRQControllers.STM32U5_EXTI @ sysbus 0x46022000
+    numberOfLines: 24
+    [0-15] -> nvic@[11-26]
+
+// GPIO reset values: RM0456 sections 13.4.1, 13.4.3 and 13.4.4 (STM32U575/585 values).
+// The EXTI port code is the EXTI_EXTICRm value (RM0456 section 23.6.8).
+gpioPortA: GPIOPort.STM32U5_GPIOPort @ sysbus <0x42020000, +0x400>
+    modeResetValue: 0xABFFFFFF
+    outputSpeedResetValue: 0x0C000000
+    pullUpPullDownResetValue: 0x64000000
+    numberOfAFs: 16
+    [0-15] -> exti#0@[0-15]
+
+gpioPortB: GPIOPort.STM32U5_GPIOPort @ sysbus <0x42020400, +0x400>
+    modeResetValue: 0xFFFFFEBF
+    outputSpeedResetValue: 0x000000C0
+    pullUpPullDownResetValue: 0x00000100
+    numberOfAFs: 16
+    [0-15] -> exti#1@[0-15]
+
+gpioPortC: GPIOPort.STM32U5_GPIOPort @ sysbus <0x42020800, +0x400>
+    modeResetValue: 0xFFFFFFFF
+    numberOfAFs: 16
+    [0-15] -> exti#2@[0-15]
+
+gpioPortD: GPIOPort.STM32U5_GPIOPort @ sysbus <0x42020C00, +0x400>
+    modeResetValue: 0xFFFFFFFF
+    numberOfAFs: 16
+    [0-15] -> exti#3@[0-15]
+
+gpioPortE: GPIOPort.STM32U5_GPIOPort @ sysbus <0x42021000, +0x400>
+    modeResetValue: 0xFFFFFFFF
+    numberOfAFs: 16
+    [0-15] -> exti#4@[0-15]
+
+gpioPortF: GPIOPort.STM32U5_GPIOPort @ sysbus <0x42021400, +0x400>
+    modeResetValue: 0xFFFFFFFF
+    numberOfAFs: 16
+    [0-15] -> exti#5@[0-15]
+
+gpioPortG: GPIOPort.STM32U5_GPIOPort @ sysbus <0x42021800, +0x400>
+    modeResetValue: 0xFFFFFFFF
+    numberOfAFs: 16
+    [0-15] -> exti#6@[0-15]
+
+gpioPortH: GPIOPort.STM32U5_GPIOPort @ sysbus <0x42021C00, +0x400>
+    modeResetValue: 0xFFFFFFFF
+    numberOfAFs: 16
+    [0-15] -> exti#7@[0-15]
+
+gpioPortI: GPIOPort.STM32U5_GPIOPort @ sysbus <0x42022000, +0x400>
+    modeResetValue: 0x0000FFFF
+    numberOfAFs: 16
+    [0-15] -> exti#8@[0-15]
+
+// USART1-3 are full-featured, UART4/5 basic (no smartcard), LPUART1 low-power
+// (RM0456 Table 673). The kernel clock is provided by RCC; the initial value is the reset PCLK.
+// Receive DMA requests: usart1_rx_dma 24, usart2 26, usart3 28, uart4 30, uart5 32, lpuart1 34
+// (RM0456 17.3.3).
+usart1: UART.STM32U5_USART @ sysbus 0x40013800
+    frequency: 4000000
+    IRQ -> nvic@61
+    ReceiveDmaRequest -> gpdma1@24
+
+usart2: UART.STM32U5_USART @ sysbus 0x40004400
+    frequency: 4000000
+    IRQ -> nvic@62
+    ReceiveDmaRequest -> gpdma1@26
+
+usart3: UART.STM32U5_USART @ sysbus 0x40004800
+    frequency: 4000000
+    IRQ -> nvic@63
+    ReceiveDmaRequest -> gpdma1@28
+
+uart4: UART.STM32U5_USART @ sysbus 0x40004C00
+    frequency: 4000000
+    smartcardSupported: false
+    IRQ -> nvic@64
+    ReceiveDmaRequest -> gpdma1@30
+
+uart5: UART.STM32U5_USART @ sysbus 0x40005000
+    frequency: 4000000
+    smartcardSupported: false
+    IRQ -> nvic@65
+    ReceiveDmaRequest -> gpdma1@32
+
+lpuart1: UART.STM32U5_USART @ sysbus 0x46002400
+    frequency: 4000000
+    lowPowerMode: true
+    IRQ -> nvic@66
+    ReceiveDmaRequest -> gpdma1@34
+
+// SPI1 and SPI2 are full-featured, SPI3 is limited (RM0456 Table 696). Receive DMA requests
+// go to the GPDMA1 request inputs spi1_rx_dma 6, spi2_rx_dma 8, spi3_rx_dma 10 (RM0456 17.3.3).
+spi1: SPI.STM32U5_SPI @ sysbus 0x40013000
+    IRQ -> nvic@59
+    DMARecieve -> gpdma1@6
+
+spi2: SPI.STM32U5_SPI @ sysbus 0x40003800
+    IRQ -> nvic@60
+    DMARecieve -> gpdma1@8
+
+spi3: SPI.STM32U5_SPI @ sysbus 0x46002000
+    limitedFeatures: true
+    IRQ -> nvic@99
+    DMARecieve -> gpdma1@10
+
+// I2C1-4 are identical (RM0456 Table 653). Receive DMA requests: i2c1_rx_dma 12, i2c2 15, i2c3 18,
+// i2c4 21 (RM0456 17.3.3).
+i2c1: I2C.STM32U5_I2C @ sysbus 0x40005400
+    EventInterrupt -> nvic@55
+    ErrorInterrupt -> nvic@56
+    DmaReceive -> gpdma1@12
+
+i2c2: I2C.STM32U5_I2C @ sysbus 0x40005800
+    EventInterrupt -> nvic@57
+    ErrorInterrupt -> nvic@58
+    DmaReceive -> gpdma1@15
+
+i2c3: I2C.STM32U5_I2C @ sysbus 0x46002800
+    EventInterrupt -> nvic@88
+    ErrorInterrupt -> nvic@89
+    DmaReceive -> gpdma1@18
+
+i2c4: I2C.STM32U5_I2C @ sysbus 0x40008400
+    EventInterrupt -> nvic@101
+    ErrorInterrupt -> nvic@100
+    DmaReceive -> gpdma1@21
+
+// FDCAN1 and its message RAM (RM0456 memory map: 0x4000 AC00 - 0x4000 AFFF, 1 KB). The
+// STM32U5 FDCAN is the L5 variant of the Renode model (same register map and message RAM
+// layout); Renode 1.17.0 has no U5 series value.
+fdcanRAM: Memory.ArrayMemory @ sysbus 0x4000AC00
+    size: 0x400
+
+fdcan1: CAN.STM32U5_FDCAN @ sysbus 0x4000A400
+    series: .L5
+    messageRam: fdcanRAM
+    Int0 -> nvic@39
+    Int1 -> nvic@40
+
+// GPDMA1, 16 channels (RM0456 Table 135); channels 0-7 -> IRQ 29-36, 8-15 -> IRQ 80-87.
+gpdma1: DMA.STM32U5_GPDMA @ sysbus 0x40020000
+    numberOfChannels: 16
+    [0-7] -> nvic@[29-36]
+    [8-15] -> nvic@[80-87]

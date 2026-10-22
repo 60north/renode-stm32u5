@@ -1,0 +1,684 @@
+//
+// Copyright (c) 2026 Fedor Druzhinin
+// Copyright (c) 2010-2026 Antmicro
+//
+// This file is licensed under the MIT License.
+//
+// STM32U5 USART/UART/LPUART, RM0456 Rev 7 sections 66 and 67.
+//
+// Adapted from renode-infrastructure
+//   src/Emulator/Peripherals/Peripherals/UART/STM32F7_USART.cs @ 7ea0541f8d9b
+// (master; newer than the model in Renode 1.17.0: receive rate limited to the baud rate,
+// corrected divisor calculation, fields that must not change while UE = 1).
+// Changes for STM32U5 (register layout and bits: stm32u575xx.h):
+// - USART_PRESC (0x2C): clock prescaler, applied to the baud rate (RM0456 66.8.15).
+// - USART_AUTOCR (0x30, reset 0x8000 0000): stored; autonomous mode is not modelled.
+// - FIFO mode: FIFOEN, TXFEIE, RXFFIE (CR1), TXFTIE, RXFTCFG, RXFTIE, TXFTCFG (CR3),
+//   TXFE, RXFF, RXFT, TXFT (ISR), TXFECF (ICR), TXFRQ (RQR bit 4). Transmission is immediate,
+//   so the TX FIFO is always empty; the RX flags follow the number of received characters
+//   (FIFO depth 8, RXFF at 8 + 1 in RDR, RM0456 66.8.10).
+// - USART_ISR reset value per instance (RM0456 66.8.11): 0x0280 00C0 with smartcard support,
+//   0x0080 00C0 without, LPUART 0x0000 00C0 (RM0456 67.7.9).
+// - The kernel clock is settable through IHasFrequency so that RCC can provide it.
+// - Fields that must not change while UE = 1 are restored through a getter: upstream the
+//   callback captured the field before it was assigned and a write while enabled threw
+//   NullReferenceException.
+// - CR3 bits 20-22 (WUS, WUFIE) and UCESM do not exist on STM32U5 and are reserved; EIE is
+//   stored instead of tagged (used by HAL_UART_Receive_IT).
+// Limitations: overrun (ORE) is never reported and the receive queue is unbounded; LIN, IrDA,
+// smartcard, synchronous, autonomous and wake-up features are not modelled.
+//
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+using Antmicro.Renode.Core;
+using Antmicro.Renode.Core.Structure.Registers;
+using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Time;
+
+namespace Antmicro.Renode.Peripherals.UART
+{
+    [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
+    public sealed class STM32U5_USART : UARTBase, IUARTWithBufferState, IDoubleWordPeripheral, IKnownSize, IHasFrequency
+    {
+        public STM32U5_USART(IMachine machine, ulong frequency, bool lowPowerMode = false, bool smartcardSupported = true) : base(machine)
+        {
+            this.smartcardSupported = smartcardSupported;
+            IRQ = new GPIO();
+            ReceiveDmaRequest = new GPIO();
+            RegistersCollection = new DoubleWordRegisterCollection(this);
+            this.frequency = frequency;
+            this.lowPowerMode = lowPowerMode;
+            this.machine = machine;
+            DefineRegisters();
+            ConfigureReceiverThread();
+        }
+
+        public override void Reset()
+        {
+            base.Reset();
+            RegistersCollection.Reset();
+            IRQ.Unset();
+            receiverTimeoutCancellationTokenSrc?.Cancel();
+            ReceiveDmaRequest.Unset();
+        }
+
+        public override void WriteChar(byte value)
+        {
+            bool needRestart;
+            lock(intermediateReceiveQueue)
+            {
+                intermediateReceiveQueue.Enqueue(value);
+                needRestart = intermediateReceiveQueue.Count == 1;
+            }
+            if(needRestart)
+            {
+                receiverThread?.Restart();
+            }
+        }
+
+        public uint ReadDoubleWord(long offset)
+        {
+            return RegistersCollection.Read(offset);
+        }
+
+        public void WriteDoubleWord(long offset, uint value)
+        {
+            RegistersCollection.Write(offset, value);
+        }
+
+        public override uint BaudRate =>
+            (uint)(BaudRateMultiplier * (frequency / PrescalerDivider) / Math.Max(1, BaudRateDivisor));
+
+        // Kernel clock of the USART before PRESC, provided by RCC.
+        public ulong Frequency
+        {
+            get => frequency;
+            set
+            {
+                if(frequency == value)
+                {
+                    return;
+                }
+                frequency = value;
+                BaudRateChanged();
+            }
+        }
+
+        public override Bits StopBits
+        {
+            get
+            {
+                switch(stopBits.Value)
+                {
+                case 0:
+                    return Bits.One;
+                case 1:
+                    return Bits.Half;
+                case 2:
+                    return Bits.Two;
+                case 3:
+                    return Bits.OneAndAHalf;
+                default:
+                    throw new InvalidOperationException("Should not reach here.");
+                }
+            }
+        }
+
+        public override Parity ParityBit
+        {
+            get
+            {
+                if(!parityControlEnabled.Value)
+                {
+                    return Parity.None;
+                }
+                return paritySelection.Value ? Parity.Odd : Parity.Even;
+            }
+        }
+
+        public GPIO IRQ { get; }
+
+        public GPIO ReceiveDmaRequest { get; }
+
+        public long Size => 0x400;
+
+        public DoubleWordRegisterCollection RegistersCollection { get; }
+
+        public BufferState BufferState
+        {
+            get
+            {
+                return bufferState;
+            }
+
+            private set
+            {
+                if(bufferState == value)
+                {
+                    return;
+                }
+                bufferState = value;
+                UpdateInterrupt();
+                BufferStateChanged?.Invoke(value);
+                ReceiveDmaRequest.Set(receiveDmaEnabled.Value && value != BufferState.Empty);
+            }
+        }
+
+        public event Action<BufferState> BufferStateChanged;
+
+        protected override void CharWritten()
+        {
+            BufferState = BufferState.Ready;
+            UpdateInterrupt();
+            if(receiverTimeoutOccurred != null && receiverTimeoutInterruptEnable.Value)
+            {
+                // We just got a character - cancel the previous action
+                // If it has already executed - then it's alright, since the timeout held
+                receiverTimeoutCancellationTokenSrc?.Cancel();
+                // Set up a new action to fire after specified time if no characters are received
+                // again, if it receives any, this should be cancelled too, in the exact same way
+                receiverTimeoutCancellationTokenSrc = new CancellationTokenSource();
+                var receiverTimeoutCancellationToken = receiverTimeoutCancellationTokenSrc.Token;
+                // Receiver timeout is specified in bits of inactivity, so divide by the baud rate to calculate time
+                // and multiply by 8 since it's a baud rate (measures bits), and by million to convert to microseconds
+                var timeoutIn = (receiverTimeout.Value * 8000000) / BaudRate;
+                Machine.ScheduleAction(TimeInterval.FromMicroseconds(timeoutIn), _ => ReportRxTimeout(receiverTimeoutCancellationToken), name: $"{nameof(STM32U5_USART)} Receiver timeout");
+            }
+        }
+
+        protected override void QueueEmptied()
+        {
+            BufferState = BufferState.Empty;
+        }
+
+        protected override bool IsReceiveEnabled => receiveEnabled.Value && enabled.Value;
+
+        private void DefineRegisters()
+        {
+            var cr1 = Registers.ControlRegister1.Define(RegistersCollection)
+                .WithFlag(0, out enabled, name: "UE")
+                .WithTaggedFlag("UESM", 1)
+                .WithFlag(2, out receiveEnabled, name: "RE")
+                .WithFlag(3, out transmitEnabled, writeCallback: (_, value) =>
+                {
+                    if(!value)
+                    {
+                        transferComplete.Value = true;
+                    }
+                }, name: "TE")
+                .WithTaggedFlag("IDLEIE", 4)
+                .WithFlag(5, out readRegisterNotEmptyInterruptEnabled, name: "RXNEIE")
+                .WithFlag(6, out transferCompleteInterruptEnabled, name: "TCIE")
+                .WithFlag(7, out transmitRegisterEmptyInterruptEnabled, name: "TXEIE")
+                .WithFlag(8, name: "PEIE")
+                .WithFlag(9, out paritySelection, changeCallback: UndoIfEnabledCallback(() => paritySelection, "PS"), name: "PS")
+                .WithFlag(10, out parityControlEnabled, changeCallback: UndoIfEnabledCallback(() => parityControlEnabled, "PCE"), name: "PCE")
+                .WithTaggedFlag("WAKE", 11)
+                .WithTaggedFlag("MO", 12)
+                .WithTaggedFlag("MME", 13)
+                .WithTaggedFlag("CMIE", 14)
+                .WithTag("DEDT", 16, 5)
+                .WithTag("DEAT", 21, 5)
+                .WithTaggedFlag("M1", 28)
+                .WithFlag(29, out fifoEnabled, changeCallback: UndoIfEnabledCallback(() => fifoEnabled, "FIFOEN"), name: "FIFOEN")
+                .WithFlag(30, out transmitFifoEmptyInterruptEnabled, name: "TXFEIE")
+                .WithFlag(31, out receiveFifoFullInterruptEnabled, name: "RXFFIE")
+                .WithWriteCallback((_, __) =>
+                {
+                    // Register callbacks are called after field callbacks,
+                    // so `wasEnabledBeforeCurrentWrite` is updated after all
+                    // `UndoIfEnableCallback`s are called, which is what we
+                    // want, since the undos judge based on the old value of the
+                    // enabled field
+                    wasEnabledBeforeCurrentWrite = enabled.Value;
+                    UpdateInterrupt();
+                });
+
+            var cr2 = Registers.ControlRegister2.Define(RegistersCollection)
+                .WithReservedBits(0, 4)
+                .WithTaggedFlag("ADDM7", 4)
+                .WithReservedBits(7, 1)
+                .WithValueField(12, 2, out stopBits, changeCallback: UndoIfEnabledCallback(() => stopBits, "STOP"), name: "STOP")
+                .WithTaggedFlag("SWAP", 15)
+                .WithTaggedFlag("RXINV", 16)
+                .WithTaggedFlag("TXINV", 17)
+                .WithTaggedFlag("DATAINV", 18)
+                .WithTaggedFlag("MSBFIRST", 19)
+                .WithTag("ADD", 24, 8);
+
+            var cr3 = Registers.ControlRegister3.Define(RegistersCollection)
+                .WithFlag(0, name: "EIE")
+                .WithTaggedFlag("HDSEL", 3)
+                .WithFlag(6, out receiveDmaEnabled, name: "DMAR")
+                .WithFlag(7, name: "DMAT")
+                .WithTaggedFlag("RTSE", 8)
+                .WithTaggedFlag("CTSE", 9)
+                .WithTaggedFlag("CTSIE", 10)
+                .WithTaggedFlag("OVRDIS", 12)
+                .WithTaggedFlag("DDRE", 13)
+                .WithTaggedFlag("DEM", 14)
+                .WithTaggedFlag("DEP", 15)
+                .WithReservedBits(16, 1)
+                .WithReservedBits(20, 3)
+                .WithFlag(23, out transmitFifoThresholdInterruptEnabled, name: "TXFTIE")
+                .WithValueField(25, 3, out receiveFifoThreshold, changeCallback: UndoIfEnabledCallback(() => receiveFifoThreshold, "RXFTCFG"), name: "RXFTCFG")
+                .WithFlag(28, out receiveFifoThresholdInterruptEnabled, name: "RXFTIE")
+                .WithValueField(29, 3, out transmitFifoThreshold, changeCallback: UndoIfEnabledCallback(() => transmitFifoThreshold, "TXFTCFG"), name: "TXFTCFG")
+                .WithWriteCallback((_, __) => UpdateInterrupt());
+
+            Registers.BaudRate.Define(RegistersCollection)
+                .WithValueField(0, lowPowerMode ? 20 : 16, out baudRateDivisor, changeCallback: (oldVal, newVal) =>
+                {
+                    if(BaudRateDivisorIsBad)
+                    {
+                        baudRateDivisor.Value = oldVal;
+                    }
+                    BaudRateChanged();
+                }, name: "BRR")
+                .WithReservedBits(lowPowerMode ? 20 : 16, lowPowerMode ? 12 : 16);
+
+            var request = Registers.Request.Define(RegistersCollection)
+                .WithFlag(1, FieldMode.Write, name: "SBKRQ")
+                .WithFlag(2, FieldMode.Write, name: "MMRQ")
+                .WithFlag(3, FieldMode.Write, writeCallback: (_, value) =>
+                {
+                    if(value)
+                    {
+                        ClearBuffer();
+                    }
+                }, name: "RXFRQ")
+                .WithFlag(4, FieldMode.Write, name: "TXFRQ")
+                .WithReservedBits(5, 27);
+
+            var isr = Registers.InterruptAndStatus.Define(RegistersCollection, lowPowerMode ? 0xC0u : smartcardSupported ? 0x028000C0u : 0x008000C0u)
+                .WithTaggedFlag("PE", 0)
+                .WithTaggedFlag("FE", 1)
+                .WithTaggedFlag("NF", 2)
+                .WithTaggedFlag("ORE", 3)
+                .WithTaggedFlag("IDLE", 4)
+                .WithFlag(5, FieldMode.Read, valueProviderCallback: _ => (Count != 0), name: "RXNE")
+                .WithFlag(6, out transferComplete, FieldMode.Read, name: "TC")
+                .WithFlag(7, FieldMode.Read, name: "TXE", valueProviderCallback: _ => true)
+                .WithTaggedFlag("CTSIF", 9)
+                .WithTaggedFlag("CTS", 10)
+                .WithTaggedFlag("UDR", 13)
+                .WithTaggedFlag("BUSY", 16)
+                .WithTaggedFlag("CMF", 17)
+                .WithTaggedFlag("SBKF", 18)
+                .WithTaggedFlag("RWU", 19)
+                .WithTaggedFlag("WUF", 20)
+                .WithFlag(21, FieldMode.Read, name: "TEACK", valueProviderCallback: _ => transmitEnabled.Value)
+                .WithFlag(22, FieldMode.Read, name: "REACK", valueProviderCallback: _ => receiveEnabled.Value)
+                .WithFlag(23, FieldMode.Read, valueProviderCallback: _ => TransmitFifoEmpty, name: "TXFE")
+                .WithFlag(24, FieldMode.Read, valueProviderCallback: _ => ReceiveFifoFull, name: "RXFF")
+                .WithFlag(26, FieldMode.Read, valueProviderCallback: _ => ReceiveFifoThresholdReached, name: "RXFT")
+                .WithFlag(27, FieldMode.Read, valueProviderCallback: _ => TransmitFifoThresholdReached, name: "TXFT")
+                .WithReservedBits(28, 4);
+
+            var icr = Registers.InterruptFlagClear.Define(RegistersCollection)
+                .WithTaggedFlag("PECF", 0)
+                .WithTaggedFlag("FECF", 1)
+                .WithTaggedFlag("NCF", 2)
+                .WithTaggedFlag("ORECF", 3)
+                .WithTaggedFlag("IDLECF", 4)
+                .WithFlag(5, FieldMode.WriteOneToClear, name: "TXFECF")
+                // the TC flag is cleared by writing 1 to TCCF
+                .WithFlag(6, FieldMode.Read | FieldMode.WriteOneToClear, name: "TCCF",
+                    writeCallback: (_, val) => { if(val) transferComplete.Value = false; })
+                .WithTaggedFlag("CTSCF", 9)
+                .WithReservedBits(10, 1)
+                .WithTaggedFlag("UDRCF", 13)
+                .WithReservedBits(14, 3)
+                .WithTaggedFlag("CMCF", 17)
+                .WithReservedBits(18, 2)
+                .WithTaggedFlag("WUCF", 20)
+                .WithReservedBits(21, 11)
+                .WithWriteCallback((_, __) => UpdateInterrupt());
+
+            Registers.Prescaler.Define(RegistersCollection)
+                .WithValueField(0, 4, out prescaler, changeCallback: (oldValue, newValue) =>
+                {
+                    UndoIfEnabledCallback(() => prescaler, "PRESCALER")(oldValue, newValue);
+                    BaudRateChanged();
+                }, name: "PRESCALER")
+                .WithReservedBits(4, 28);
+
+            Registers.AutonomousModeControl.Define(RegistersCollection, 0x80000000)
+                .WithValueField(0, 16, name: "TDN")
+                .WithFlag(16, name: "TRIGPOL")
+                .WithFlag(17, name: "TRIGEN")
+                .WithFlag(18, name: "IDLEDIS")
+                .WithValueField(19, 4, name: "TRIGSEL")
+                .WithReservedBits(23, 9);
+
+            Registers.ReceiveData.Define(RegistersCollection)
+                .WithValueField(0, 8, FieldMode.Read, valueProviderCallback: _ => HandleReceiveData(), name: "RDR")
+                .WithReservedBits(8, 24);
+
+            Registers.TransmitData.Define(RegistersCollection)
+                .WithValueField(0, 8,
+                    // reading this register will intentionally return the last written value
+                    writeCallback: (_, val) => HandleTransmitData((uint)val), name: "TDR")
+                .WithReservedBits(8, 24);
+
+            if(lowPowerMode)
+            {
+                cr1
+                    .WithReservedBits(15, 1)
+                    .WithReservedBits(26, 2);
+
+                cr2
+                    .WithReservedBits(5, 2)
+                    .WithReservedBits(8, 4)
+                    .WithReservedBits(14, 1)
+                    .WithReservedBits(20, 4);
+
+                cr3
+                    .WithReservedBits(1, 2)
+                    .WithReservedBits(4, 2)
+                    .WithReservedBits(11, 1)
+                    .WithReservedBits(17, 3)
+                    .WithReservedBits(24, 1);
+
+                request
+                    .WithReservedBits(0, 1);
+
+                isr
+                    .WithReservedBits(8, 1)
+                    .WithReservedBits(11, 2)
+                    .WithReservedBits(14, 2)
+                    .WithReservedBits(25, 1);
+
+                icr
+                    .WithReservedBits(7, 2)
+                    .WithReservedBits(11, 2);
+            }
+            else
+            {
+                Registers.ReceiverTimeout.Define(RegistersCollection)
+                    .WithValueField(0, 24, out receiverTimeout, name: "RTO (Receiver Timeout value)")
+                    .WithTag("BLEN (Block length)", 24, 8);
+
+                cr1
+                    .WithFlag(15, out over8, changeCallback: (oldVal, newVal) =>
+                    {
+                        UndoIfEnabledCallback(() => over8, "OVER8")(oldVal, newVal);
+                        if(BaudRateDivisorIsBad)
+                        {
+                            over8.Value = oldVal;
+                        }
+                        BaudRateChanged();
+                    }, name: "OVER8")
+                    .WithFlag(26, out receiverTimeoutInterruptEnable, name: "RTOIE")
+                    .WithTaggedFlag("EOBIE", 27)
+                    .WithWriteCallback((_, __) =>
+                        {
+                            // Need to cancel the previous receiverTimeout here
+                            if(!enabled.Value || !receiveEnabled.Value || !receiverTimeoutInterruptEnable.Value)
+                            {
+                                receiverTimeoutCancellationTokenSrc?.Cancel();
+                            }
+                        }
+                    );
+
+                cr2
+                    .WithTaggedFlag("LBDL", 5)
+                    .WithTaggedFlag("LBDIE", 6)
+                    .WithTaggedFlag("LBCL", 8)
+                    .WithTaggedFlag("CPHA", 9)
+                    .WithTaggedFlag("CPOL", 10)
+                    .WithTaggedFlag("CLKEN", 11)
+                    .WithTaggedFlag("LINEN", 14)
+                    .WithTaggedFlag("ABREN", 20)
+                    .WithTag("ABRMOD", 21, 2)
+                    .WithTaggedFlag("RTOEN", 23);
+
+                cr3
+                    .WithTaggedFlag("IREN", 1)
+                    .WithTaggedFlag("IRLP", 2)
+                    .WithTaggedFlag("NACK", 4)
+                    .WithTaggedFlag("SCEN", 5)
+                    .WithTaggedFlag("ONEBIT", 11)
+                    .WithTag("SCARCNT", 17, 3)
+                    .WithTaggedFlag("TCBGTIE", 24);
+
+                request
+                    .WithTaggedFlag("ABRRQ", 0);
+
+                isr
+                    .WithTaggedFlag("LBDF", 8)
+                    .WithFlag(11, FieldMode.Read, valueProviderCallback: _ => receiverTimeoutInterruptEnable.Value && (receiverTimeoutOccurred?.Value ?? false), name: "RTOF")
+                    .WithTaggedFlag("EOBF", 12)
+                    .WithTaggedFlag("ABRE", 14)
+                    .WithTaggedFlag("ABRF", 15)
+                    .WithFlag(25, FieldMode.Read, name: "TCBGT");
+
+                icr
+                    .WithTaggedFlag("TCBGTCF", 7)
+                    .WithTaggedFlag("LBDCF", 8)
+                    .WithFlag(11, out receiverTimeoutOccurred, FieldMode.WriteOneToClear, name: "RTOCF")
+                    .WithTaggedFlag("EOBCF", 12)
+                    .WithWriteCallback((_, __) => UpdateInterrupt());
+            }
+        }
+
+        private void HandleTransmitData(uint value)
+        {
+            if(transmitEnabled.Value && enabled.Value)
+            {
+                base.TransmitCharacter((byte)value);
+                transferComplete.Value = true;
+                UpdateInterrupt();
+            }
+            else
+            {
+                this.Log(LogLevel.Warning, "Char was to be sent, but the transmitter (or the whole USART) is not enabled. Ignoring.");
+            }
+        }
+
+        private uint HandleReceiveData()
+        {
+            if(!TryGetCharacter(out var result))
+            {
+                this.Log(LogLevel.Warning, "No characters in queue.");
+            }
+            UpdateInterrupt();
+            return result;
+        }
+
+        private void UpdateInterrupt()
+        {
+            var transmitRegisterEmptyInterrupt = transmitRegisterEmptyInterruptEnabled.Value; // we assume that transmit register is always empty
+            var transferCompleteInterrupt = transferComplete.Value && transferCompleteInterruptEnabled.Value;
+            var readRegisterNotEmptyInterrupt = Count != 0 && readRegisterNotEmptyInterruptEnabled.Value;
+
+            // This interrupt is expected to fire if there are not additional bits incoming after some specified time after last reception
+            var receiverTimeoutInterrupt = (receiverTimeoutOccurred?.Value ?? false) && receiverTimeoutInterruptEnable.Value;
+
+            var fifoInterrupt = (TransmitFifoEmpty && transmitFifoEmptyInterruptEnabled.Value)
+                || (ReceiveFifoFull && receiveFifoFullInterruptEnabled.Value)
+                || (ReceiveFifoThresholdReached && receiveFifoThresholdInterruptEnabled.Value)
+                || (TransmitFifoThresholdReached && transmitFifoThresholdInterruptEnabled.Value);
+
+            IRQ.Set(transmitRegisterEmptyInterrupt || transferCompleteInterrupt || readRegisterNotEmptyInterrupt || receiverTimeoutInterrupt || fifoInterrupt);
+        }
+
+        private void ReportRxTimeout(CancellationToken ct)
+        {
+            if(!ct.IsCancellationRequested)
+            {
+                receiverTimeoutOccurred.Value = true;
+                UpdateInterrupt();
+            }
+        }
+
+        private Action<T, T> UndoIfEnabledCallback<T>(Func<IRegisterField<T>> field, string fieldName) => (T oldValue, T _) =>
+        {
+            if(!wasEnabledBeforeCurrentWrite)
+            {
+                return;
+            }
+            this.WarningLog("{0} field was written to while UART was enabled", fieldName);
+            field().Value = oldValue;
+        };
+
+        private void BaudRateChanged()
+        {
+            ConfigureReceiverThread();
+        }
+
+        private void ConfigureReceiverThread()
+        {
+            lock(receiverThreadLock)
+            {
+                receiverThread?.Dispose();
+                receiverThread = machine.ObtainManagedThread(
+                    action: () =>
+                    {
+                        byte value;
+                        lock(intermediateReceiveQueue)
+                        {
+                            if(!intermediateReceiveQueue.TryDequeue(out value))
+                            {
+                                return;
+                            }
+                        }
+
+                        WriteCharInner(value, null);
+                    },
+                    period: this.GetActualTransmissionDuration(8),
+                    name: $"{nameof(STM32U5_USART)} receiver",
+                    owner: this,
+                    stopCondition: () =>
+                    {
+                        lock(intermediateReceiveQueue)
+                        {
+                            return intermediateReceiveQueue.Count == 0;
+                        }
+                    }
+                );
+
+                if(intermediateReceiveQueue.Count > 0)
+                {
+                    receiverThread.Restart();
+                }
+            }
+        }
+
+        private bool Over8 => over8 == null ? false : over8.Value;
+
+        // PRESCALER encoding (RM0456 66.8.15); reserved values divide by 256.
+        private ulong PrescalerDivider => prescaler == null ? 1 : PrescalerDividers[Math.Min((int)prescaler.Value, PrescalerDividers.Length - 1)];
+
+        private bool FifoEnabled => fifoEnabled?.Value ?? false;
+
+        // Transmission is immediate: the TX FIFO never holds data. LPUART_ISR resets with TXFE = 0
+        // (RM0456 67.7.9), so for the LPUART the flag is reported only in FIFO mode.
+        private bool TransmitFifoEmpty => !lowPowerMode || FifoEnabled;
+
+        private bool TransmitFifoThresholdReached => FifoEnabled;
+
+        // RXFF: FIFO depth plus the character in RDR (RM0456 66.8.10).
+        private bool ReceiveFifoFull => FifoEnabled && Count >= FifoDepth + 1;
+
+        // RXFTCFG: 1/8, 1/4, 1/2, 3/4, 7/8 of the depth or full (RM0456 66.8.4).
+        private bool ReceiveFifoThresholdReached => FifoEnabled && Count >= ReceiveThresholdLevels[Math.Min((int)receiveFifoThreshold.Value, ReceiveThresholdLevels.Length - 1)];
+
+        private uint BaudRateMultiplier => lowPowerMode ? 256u : Over8 ? 2u : 1u;
+
+        private uint BaudRateDivisor
+        {
+            get
+            {
+                var baseDivisor = (uint)baudRateDivisor.Value;
+                if(!Over8)
+                {
+                    return baseDivisor;
+                }
+                return (baseDivisor & 0xfff0) | ((baseDivisor & 0x0007) << 1);
+            }
+        }
+
+        private bool BaudRateDivisorIsBad
+        {
+            get
+            {
+                if(Over8 && (baudRateDivisor.Value & 0x0080) != 0)
+                {
+                    this.WarningLog("USARTDIV[3] must be 0 when in OVER8 mode");
+                    return true;
+                }
+                if(BaudRateDivisor < 16)
+                {
+                    this.WarningLog("Baud rate divisior must be at least 16");
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        private CancellationTokenSource receiverTimeoutCancellationTokenSrc;
+
+        private IFlagRegisterField parityControlEnabled;
+        private IFlagRegisterField paritySelection;
+        private IFlagRegisterField transmitRegisterEmptyInterruptEnabled;
+        private IFlagRegisterField transferCompleteInterruptEnabled;
+        private IFlagRegisterField transferComplete;
+        private IFlagRegisterField readRegisterNotEmptyInterruptEnabled;
+        private IFlagRegisterField transmitEnabled;
+        private IFlagRegisterField receiveEnabled;
+        private IFlagRegisterField receiveDmaEnabled;
+        private IFlagRegisterField enabled;
+        private IValueRegisterField baudRateDivisor;
+        private IValueRegisterField stopBits;
+        private IFlagRegisterField over8;
+        private IFlagRegisterField receiverTimeoutInterruptEnable;
+        private IFlagRegisterField receiverTimeoutOccurred;
+        private IValueRegisterField receiverTimeout;
+        private IValueRegisterField prescaler;
+        private IFlagRegisterField fifoEnabled;
+        private IFlagRegisterField transmitFifoEmptyInterruptEnabled;
+        private IFlagRegisterField receiveFifoFullInterruptEnabled;
+        private IFlagRegisterField transmitFifoThresholdInterruptEnabled;
+        private IFlagRegisterField receiveFifoThresholdInterruptEnabled;
+        private IValueRegisterField receiveFifoThreshold;
+        private IValueRegisterField transmitFifoThreshold;
+
+        private BufferState bufferState;
+
+        private bool wasEnabledBeforeCurrentWrite;
+
+        private IManagedThread receiverThread;
+
+        private readonly Queue<byte> intermediateReceiveQueue = new();
+        private readonly object receiverThreadLock = new();
+        private readonly IMachine machine;
+
+        private ulong frequency;
+        private readonly bool lowPowerMode;
+        private readonly bool smartcardSupported;
+
+        private const int FifoDepth = 8;
+        private static readonly ulong[] PrescalerDividers = { 1, 2, 4, 6, 8, 10, 12, 16, 32, 64, 128, 256 };
+        private static readonly int[] ReceiveThresholdLevels = { 1, 2, 4, 6, 7, 8 };
+
+        private enum Registers
+        {
+            ControlRegister1   = 0x0,
+            ControlRegister2   = 0x4,
+            ControlRegister3   = 0x8,
+            BaudRate           = 0xC,
+            ReceiverTimeout    = 0x14,
+            Request            = 0x18,
+            InterruptAndStatus = 0x1C,
+            InterruptFlagClear = 0x20,
+            ReceiveData        = 0x24,
+            TransmitData       = 0x28,
+            Prescaler          = 0x2C,
+            AutonomousModeControl = 0x30,
+        }
+    }
+}

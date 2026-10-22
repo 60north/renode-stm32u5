@@ -1,0 +1,17 @@
+// STM32U575I-EV evaluation board (STM32U575AII6Q). Only the LEDs driven directly by GPIO are
+// described.
+//
+// Pins and polarity: STM32CubeU5 v1.9.0 evaluation board BSP (stm32u575i-ev-bsp v1.4.1),
+// stm32u575i_eval.h: LED5 PB7, LED6 PH7, switched on by driving the pin high (BSP_LED_On).
+// LED7 and LED8 are on the I/O expander and are not described.
+using "../cpus/stm32u575.repl"
+
+led5: Miscellaneous.LED @ gpioPortB
+
+led6: Miscellaneous.LED @ gpioPortH
+
+gpioPortB:
+    7 -> led5@0
+
+gpioPortH:
+    7 -> led6@0
