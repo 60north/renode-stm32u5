@@ -25,7 +25,7 @@ curl -sSfL https://builds.renode.io/renode-1.17.0.linux-portable.tar.gz | tar xz
 pip install -r renode_1.17.0-portable/tests/requirements.txt
 cmake -S firmware-tests -B build/firmware -G Ninja
 cmake --build build/firmware
-renode_1.17.0-portable/renode-test --results-dir build/test-results $(find tests -name '*.robot')
+renode_1.17.0-portable/renode-test $(find tests -name '*.robot')
 ```
 
 The same steps run in GitHub Actions (`.github/workflows/ci.yml`) with Renode 1.17.0 and with the

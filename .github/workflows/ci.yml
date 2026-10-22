@@ -52,11 +52,15 @@ jobs:
 
       - name: Run tests
         run: |
-          renode-portable/renode-test --results-dir build/test-results $(find tests -name '*.robot' | sort)
+          renode-portable/renode-test $(find tests -name '*.robot' | sort)
 
+      # renode-test writes the results to the working directory.
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: test-results-${{ matrix.renode }}
-          path: build/test-results
+          path: |
+            robot_output.xml
+            log.html
+            report.html
