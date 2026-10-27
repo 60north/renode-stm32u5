@@ -1,0 +1,12 @@
+// Test fixture only: an LED driven by the output of TIM4 channel 4 of an STM32U575.
+using "../../platforms/cpus/stm32u575.repl"
+
+tim4ch4: Miscellaneous.LED @ tim4 3
+
+tim4:
+    3 -> tim4ch4@0
+
+tim2ch1: Miscellaneous.LED @ tim2 0
+
+tim2:
+    0 -> tim2ch1@0

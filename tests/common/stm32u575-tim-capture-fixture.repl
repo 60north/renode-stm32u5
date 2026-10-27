@@ -1,0 +1,5 @@
+// Test fixture only: TIM3 channel 1 output drives the TIM2 TI1 input of an STM32U575.
+using "../../platforms/cpus/stm32u575.repl"
+
+tim3:
+    0 -> tim2@0

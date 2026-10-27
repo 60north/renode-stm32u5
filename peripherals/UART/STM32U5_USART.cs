@@ -20,6 +20,8 @@
 // - USART_ISR reset value per instance (RM0456 66.8.11): 0x0280 00C0 with smartcard support,
 //   0x0080 00C0 without, LPUART 0x0000 00C0 (RM0456 67.7.9).
 // - The kernel clock is settable through IHasFrequency so that RCC can provide it.
+// - Idle line detection: IDLE, IDLEIE, IDLECF (RM0456 66.8.10); IDLE is set one frame after the
+//   last received character.
 // - Fields that must not change while UE = 1 are restored through a getter: upstream the
 //   callback captured the field before it was assigned and a write while enabled threw
 //   NullReferenceException.
@@ -63,6 +65,7 @@ namespace Antmicro.Renode.Peripherals.UART
             IRQ.Unset();
             receiverTimeoutCancellationTokenSrc?.Cancel();
             ReceiveDmaRequest.Unset();
+            idleLinePending = false;
         }
 
         public override void WriteChar(byte value)
@@ -209,7 +212,7 @@ namespace Antmicro.Renode.Peripherals.UART
                         transferComplete.Value = true;
                     }
                 }, name: "TE")
-                .WithTaggedFlag("IDLEIE", 4)
+                .WithFlag(4, out idleLineDetectedInterruptEnabled, name: "IDLEIE")
                 .WithFlag(5, out readRegisterNotEmptyInterruptEnabled, name: "RXNEIE")
                 .WithFlag(6, out transferCompleteInterruptEnabled, name: "TCIE")
                 .WithFlag(7, out transmitRegisterEmptyInterruptEnabled, name: "TXEIE")
@@ -298,7 +301,7 @@ namespace Antmicro.Renode.Peripherals.UART
                 .WithTaggedFlag("FE", 1)
                 .WithTaggedFlag("NF", 2)
                 .WithTaggedFlag("ORE", 3)
-                .WithTaggedFlag("IDLE", 4)
+                .WithFlag(4, out idleLineDetected, FieldMode.Read, name: "IDLE")
                 .WithFlag(5, FieldMode.Read, valueProviderCallback: _ => (Count != 0), name: "RXNE")
                 .WithFlag(6, out transferComplete, FieldMode.Read, name: "TC")
                 .WithFlag(7, FieldMode.Read, name: "TXE", valueProviderCallback: _ => true)
@@ -323,7 +326,13 @@ namespace Antmicro.Renode.Peripherals.UART
                 .WithTaggedFlag("FECF", 1)
                 .WithTaggedFlag("NCF", 2)
                 .WithTaggedFlag("ORECF", 3)
-                .WithTaggedFlag("IDLECF", 4)
+                .WithFlag(4, FieldMode.WriteOneToClear, writeCallback: (_, value) =>
+                {
+                    if(value)
+                    {
+                        idleLineDetected.Value = false;
+                    }
+                }, name: "IDLECF")
                 .WithFlag(5, FieldMode.WriteOneToClear, name: "TXFECF")
                 // the TC flag is cleared by writing 1 to TCCF
                 .WithFlag(6, FieldMode.Read | FieldMode.WriteOneToClear, name: "TCCF",
@@ -503,7 +512,9 @@ namespace Antmicro.Renode.Peripherals.UART
                 || (ReceiveFifoThresholdReached && receiveFifoThresholdInterruptEnabled.Value)
                 || (TransmitFifoThresholdReached && transmitFifoThresholdInterruptEnabled.Value);
 
-            IRQ.Set(transmitRegisterEmptyInterrupt || transferCompleteInterrupt || readRegisterNotEmptyInterrupt || receiverTimeoutInterrupt || fifoInterrupt);
+            var idleLineInterrupt = idleLineDetected.Value && idleLineDetectedInterruptEnabled.Value;
+
+            IRQ.Set(transmitRegisterEmptyInterrupt || transferCompleteInterrupt || readRegisterNotEmptyInterrupt || receiverTimeoutInterrupt || fifoInterrupt || idleLineInterrupt);
         }
 
         private void ReportRxTimeout(CancellationToken ct)
@@ -539,15 +550,27 @@ namespace Antmicro.Renode.Peripherals.UART
                     action: () =>
                     {
                         byte value;
+                        bool received;
                         lock(intermediateReceiveQueue)
                         {
-                            if(!intermediateReceiveQueue.TryDequeue(out value))
+                            received = intermediateReceiveQueue.TryDequeue(out value);
+                            if(received)
                             {
-                                return;
+                                idleLinePending = true;
                             }
                         }
 
-                        WriteCharInner(value, null);
+                        if(received)
+                        {
+                            WriteCharInner(value, null);
+                        }
+                        else if(idleLinePending)
+                        {
+                            // One frame without data after a reception: idle line
+                            idleLinePending = false;
+                            idleLineDetected.Value = true;
+                            UpdateInterrupt();
+                        }
                     },
                     period: this.GetActualTransmissionDuration(8),
                     name: $"{nameof(STM32U5_USART)} receiver",
@@ -556,7 +579,7 @@ namespace Antmicro.Renode.Peripherals.UART
                     {
                         lock(intermediateReceiveQueue)
                         {
-                            return intermediateReceiveQueue.Count == 0;
+                            return intermediateReceiveQueue.Count == 0 && !idleLinePending;
                         }
                     }
                 );
@@ -638,6 +661,9 @@ namespace Antmicro.Renode.Peripherals.UART
         private IFlagRegisterField receiverTimeoutInterruptEnable;
         private IFlagRegisterField receiverTimeoutOccurred;
         private IValueRegisterField receiverTimeout;
+        private IFlagRegisterField idleLineDetected;
+        private IFlagRegisterField idleLineDetectedInterruptEnabled;
+        private bool idleLinePending;
         private IValueRegisterField prescaler;
         private IFlagRegisterField fifoEnabled;
         private IFlagRegisterField transmitFifoEmptyInterruptEnabled;

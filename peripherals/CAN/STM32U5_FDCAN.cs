@@ -16,6 +16,10 @@
 // - Extended IDs are filtered with all 29 bits (upstream truncates the ID to 16 bits).
 // - CCCR.TXP is stored (written by HAL_FDCAN_Init); bus timing is not modelled.
 // - PSR.EW is set when an error counter has reached 96 (upstream had the condition inverted).
+// - Bus timing: a frame is transmitted after its transmission time at the nominal bit rate; the
+//   Tx buffers, the Tx FIFO/queue status, cancellation and TC/TFE/TCF follow the transmissions;
+//   a frame received with a full Rx FIFO is lost or overwrites the oldest element; no frame is
+//   received in initialization mode; the kernel clock is set by RCC.
 //
 
 using System;
@@ -37,7 +41,7 @@ using Antmicro.Renode.Utilities.Packets;
 
 namespace Antmicro.Renode.Peripherals.CAN
 {
-    public class STM32U5_FDCAN : BasicDoubleWordPeripheral, ICAN, IKnownSize
+    public class STM32U5_FDCAN : BasicDoubleWordPeripheral, ICAN, IKnownSize, IHasFrequency
     {
         public STM32U5_FDCAN(IMachine machine, STM32Series series, ArrayMemory messageRam) : base(machine)
         {
@@ -61,24 +65,7 @@ namespace Antmicro.Renode.Peripherals.CAN
             rxFIFOFull = new IFlagRegisterField[2];
             rxFIFOGetIndex = new IValueRegisterField[2];
             rxFIFOPutIndex = new IValueRegisterField[2];
-            rxFIFOBuffers = new Queue<Action>[2];
-            rxFIFOBuffers[0] = new Queue<Action>();
-            rxFIFOBuffers[1] = new Queue<Action>();
             DefineRegisters();
-
-            rxDequeueThread = machine.ObtainManagedThread(() =>
-            {
-                for(var i = 0; i < rxFIFOBuffers.Count(); i++)
-                {
-                    lock(rxFIFOBuffers[i])
-                    {
-                        if(!rxFIFOFull[i].Value && rxFIFOBuffers[i].TryDequeue(out var action))
-                        {
-                            action.Invoke();
-                        }
-                    }
-                }
-            }, TimeInterval.FromMicroseconds(20), "FDCAN rxDequeueThread", this, () => rxFIFOBuffers.All((buf) => buf.Count() == 0));
 
             Reset();
         }
@@ -100,10 +87,11 @@ namespace Antmicro.Renode.Peripherals.CAN
         {
             base.Reset();
             timestampCounter.Reset();
-            foreach(var buffer in rxFIFOBuffers)
-            {
-                buffer.Clear();
-            }
+            // Transmissions scheduled before the reset are dropped
+            transmissionGeneration++;
+            transmissionInProgress = false;
+            txFIFOGetIndex = 0;
+            txFIFOPutIndex = 0;
             UpdateTimerConfiguration();
             UpdateInterrupts();
             lastHighPrioBufferIndex.Value = 2;
@@ -111,6 +99,12 @@ namespace Antmicro.Renode.Peripherals.CAN
 
         public void OnFrameReceived(CANMessageFrame message)
         {
+            if(initFlag.Value)
+            {
+                // In initialization mode the FDCAN does not take part in bus activity
+                this.DebugLog("Frame received in initialization mode, dropping");
+                return;
+            }
             // Clear last error code on new message
             lastErrorCode.Value = 0;
             // FDCAN protocol status flags are updated independant of acceptance filtering
@@ -192,6 +186,19 @@ namespace Antmicro.Renode.Peripherals.CAN
         public GPIO Int1 { get; }
 
         public event Action<CANMessageFrame> FrameSent;
+
+        // Kernel clock (fdcan_ker_ck), selected by RCC_CCIPR1.FDCANSEL
+        public ulong Frequency
+        {
+            get => kernelFrequency;
+            set
+            {
+                kernelFrequency = value;
+                UpdateTimerConfiguration();
+                // Requests added without a kernel clock start when it is available
+                StartNextTransmission();
+            }
+        }
 
         private void DefineRegisters()
         {
@@ -371,51 +378,36 @@ namespace Antmicro.Renode.Peripherals.CAN
                 .WithReservedBits(0, 24);
             Registers.TxFIFOStatusRegister.Define(this, 0x00000003, name: "FDCAN_TXFQS")
                 .WithReservedBits(22, 10)
-                .WithFlag(21, mode: FieldMode.Read, valueProviderCallback: _ => false, name: "TFQF")
+                .WithFlag(21, mode: FieldMode.Read, valueProviderCallback: _ => requestPendingFlags.Value == AllTxBuffers, name: "TFQF")
                 .WithReservedBits(18, 3)
-                .WithValueField(16, 2, mode: FieldMode.Read, valueProviderCallback: _ => 0, name: "TFQPI")
+                .WithValueField(16, 2, mode: FieldMode.Read, valueProviderCallback: _ => TxPutIndex, name: "TFQPI")
                 .WithReservedBits(10, 6)
-                .WithValueField(8, 2, mode: FieldMode.Read, valueProviderCallback: _ => 0, name: "TFGI")
+                .WithValueField(8, 2, mode: FieldMode.Read, valueProviderCallback: _ => txFIFOQueueModeFlag.Value ? 0 : txFIFOGetIndex, name: "TFGI")
                 .WithReservedBits(3, 5)
                 .WithValueField(0, 3,
-                    valueProviderCallback: _ => txFIFOQueueModeFlag.Value ? 0 : (ulong)3,
+                    valueProviderCallback: _ => txFIFOQueueModeFlag.Value ? 0 : (ulong)(TxBufferCount - BitHelper.GetSetBits(requestPendingFlags.Value).Count),
                     name: "TFFL");
             Registers.TxBufferRequestPendingRegister.Define(this, name: "FDCAN_TXBRP")
                 .WithReservedBits(3, 29)
-                .WithValueField(0, 3, out requestPendingFlags, name: "TRP");
+                .WithValueField(0, 3, out requestPendingFlags, FieldMode.Read, name: "TRP");
             Registers.TxBufferAddRequestRegister.Define(this, name: "FDCAN_TXBAR")
                 .WithReservedBits(3, 29)
-                .WithValueField(0, 3, valueProviderCallback: _ => 0, writeCallback: (_, val) =>
-                {
-                    if(val != 0)
-                    {
-                        if(initFlag.Value)
-                        {
-                            this.WarningLog("Tried to start transfer while in bus off state");
-                            requestPendingFlags.Value = val;
-                            return;
-                        }
-                        BitHelper.ForeachActiveBit(val, SendBuffer);
-                        interruptStatusFlags[(long)Interrupts.TxFIFOEmpty].Value = true;
-                        interruptStatusFlags[(long)Interrupts.TransmissionCompleted].Value = true;
-                        UpdateInterrupts();
-                    }
-                });
+                .WithValueField(0, 3, valueProviderCallback: _ => 0, writeCallback: (_, val) => AddTransmissionRequests(val));
             Registers.TxBufferCancellationRequestRegister.Define(this, name: "FDCAN_TXBCR")
                 .WithReservedBits(3, 29)
-                .WithTag("CR", 0, 3); // Transfers are never pending in Renode, so they can't be canceled
+                .WithValueField(0, 3, valueProviderCallback: _ => 0, writeCallback: (_, val) => CancelTransmissionRequests(val), name: "CR");
             Registers.TxBufferTransmissionOccuredRegister.Define(this, name: "FDCAN_TXBTO")
                 .WithReservedBits(3, 29)
                 .WithFlags(0, 3, out transmissionOccurredFlags, mode: FieldMode.Read, name: "TO");
             Registers.TxBufferCancellationFinishedRegister.Define(this, name: "FDCAN_TXBCF")
                 .WithReservedBits(3, 29)
-                .WithTag("CF", 0, 3);
+                .WithFlags(0, 3, out cancellationFinishedFlags, mode: FieldMode.Read, name: "CF");
             Registers.TxBufferTransmissionInterruptEnableRegister.Define(this, name: "FDCAN_TXBTIE")
                 .WithReservedBits(3, 29)
                 .WithFlags(0, 3, out transmissionInterruptEnableFlags, name: "TIE");
             Registers.TxBufferCancellationFinishedInterruptEnableRegister.Define(this, name: "FDCAN_TXBCIE")
                 .WithReservedBits(3, 29)
-                .WithTag("CFIE", 0, 3);
+                .WithFlags(0, 3, out cancellationFinishedInterruptEnableFlags, name: "CFIE");
             Registers.TxEventFIFOStatusRegister.Define(this, name: "FDCAN_TXEFS")
                 .WithReservedBits(26, 6)
                 .WithFlag(25, mode: FieldMode.Read, valueProviderCallback: _ => interruptStatusFlags[(long)Interrupts.TxEventFIFOElementLost].Value, name: "TEFL")
@@ -491,6 +483,171 @@ namespace Antmicro.Renode.Peripherals.CAN
             }
         }
 
+        private void AddTransmissionRequests(ulong buffers)
+        {
+            buffers &= ~requestPendingFlags.Value & AllTxBuffers;
+            if(buffers == 0)
+            {
+                return;
+            }
+            requestPendingFlags.Value |= buffers;
+            if(!txFIFOQueueModeFlag.Value)
+            {
+                txFIFOPutIndex = (txFIFOPutIndex + (ulong)BitHelper.GetSetBits(buffers).Count) % TxBufferCount;
+            }
+            foreach(var buffer in BitHelper.GetSetBits(buffers))
+            {
+                cancellationFinishedFlags[buffer].Value = false;
+            }
+            StartNextTransmission();
+        }
+
+        private void CancelTransmissionRequests(ulong buffers)
+        {
+            // The buffer being transmitted completes its transmission
+            var cancelled = buffers & requestPendingFlags.Value & ~(transmissionInProgress ? 1UL << (int)transmittedBuffer : 0);
+            foreach(var buffer in BitHelper.GetSetBits(cancelled))
+            {
+                requestPendingFlags.Value &= ~(1UL << buffer);
+                cancellationFinishedFlags[buffer].Value = true;
+                if(cancellationFinishedInterruptEnableFlags[buffer].Value)
+                {
+                    interruptStatusFlags[(long)Interrupts.TransmissionCancellationFinished].Value = true;
+                }
+            }
+            if(!txFIFOQueueModeFlag.Value && cancelled != 0)
+            {
+                txFIFOGetIndex = NextFIFOBuffer() ?? txFIFOPutIndex;
+            }
+            UpdateInterrupts();
+        }
+
+        // The next buffer to transmit: in FIFO mode the oldest pending one, in queue mode the one
+        // with the highest priority (lowest identifier, then lowest buffer number)
+        private byte? NextBufferToTransmit()
+        {
+            if(!txFIFOQueueModeFlag.Value)
+            {
+                return NextFIFOBuffer();
+            }
+            byte? next = null;
+            var nextId = uint.MaxValue;
+            foreach(var buffer in BitHelper.GetSetBits(requestPendingFlags.Value))
+            {
+                var id = PriorityId(ReadTxElement((byte)buffer));
+                if(id < nextId)
+                {
+                    next = (byte)buffer;
+                    nextId = id;
+                }
+            }
+            return next;
+        }
+
+        private byte? NextFIFOBuffer()
+        {
+            for(var i = 0UL; i < TxBufferCount; i++)
+            {
+                var buffer = (txFIFOGetIndex + i) % TxBufferCount;
+                if((requestPendingFlags.Value & (1UL << (int)buffer)) != 0)
+                {
+                    return (byte)buffer;
+                }
+            }
+            return null;
+        }
+
+        private static uint PriorityId(TxMessageElement element)
+        {
+            // Standard identifiers are compared with the 11 most significant bits of extended ones
+            return element.ExtendedId ? element.Identifier : element.StandardId << 18;
+        }
+
+        private void StartNextTransmission()
+        {
+            if(transmissionInProgress || initFlag.Value)
+            {
+                return;
+            }
+            var next = NextBufferToTransmit();
+            if(!next.HasValue)
+            {
+                return;
+            }
+            if(kernelFrequency == 0)
+            {
+                this.WarningLog("No kernel clock (RCC_CCIPR1.FDCAN1SEL): frames are not transmitted");
+                return;
+            }
+            transmissionInProgress = true;
+            transmittedBuffer = next.Value;
+            var generation = transmissionGeneration;
+            var transmitTime = TimeInterval.FromSeconds(GetBitTime() * FrameBits(ReadTxElement(transmittedBuffer)));
+            this.Log(LogLevel.Noisy, "Scheduled Tx buffer {0} for transmission after: {1}us", transmittedBuffer, transmitTime.TotalMicroseconds);
+            machine.ScheduleAction(transmitTime, _ =>
+            {
+                if(generation != transmissionGeneration)
+                {
+                    return;
+                }
+                FinishTransmission();
+            });
+        }
+
+        private void FinishTransmission()
+        {
+            transmissionInProgress = false;
+            var buffer = transmittedBuffer;
+            if(initFlag.Value || (requestPendingFlags.Value & (1UL << buffer)) == 0)
+            {
+                StartNextTransmission();
+                return;
+            }
+            SendBuffer(buffer);
+            requestPendingFlags.Value &= ~(1UL << buffer);
+            if(!txFIFOQueueModeFlag.Value)
+            {
+                txFIFOGetIndex = NextFIFOBuffer() ?? txFIFOPutIndex;
+            }
+            if(transmissionInterruptEnableFlags[buffer].Value)
+            {
+                interruptStatusFlags[(long)Interrupts.TransmissionCompleted].Value = true;
+            }
+            if(requestPendingFlags.Value == 0)
+            {
+                interruptStatusFlags[(long)Interrupts.TxFIFOEmpty].Value = true;
+            }
+            UpdateInterrupts();
+            StartNextTransmission();
+        }
+
+        private ulong FirstFreeTxBuffer()
+        {
+            for(var buffer = 0; buffer < TxBufferCount; buffer++)
+            {
+                if((requestPendingFlags.Value & (1UL << buffer)) == 0)
+                {
+                    return (ulong)buffer;
+                }
+            }
+            return 0;
+        }
+
+        private TxMessageElement ReadTxElement(byte bufferIndex)
+        {
+            var buffer = messageRam.ReadBytes((long)MessageRAMOffsets.TxBuffers + (MessageBufferElementSize * bufferIndex), MessageBufferElementSize, context: this);
+            return Packet.Decode<TxMessageElement>(buffer);
+        }
+
+        // Bits of a data frame without stuff bits, including the intermission (ISO 11898-1):
+        // 47 (standard) or 67 (extended identifier) + 8 per data byte; remote frames carry no data.
+        // FD frames are counted at the nominal bit rate.
+        private static int FrameBits(TxMessageElement element)
+        {
+            var dataBytes = element.RemoteTransmissionRequest ? 0 : element.DataLength;
+            return (element.ExtendedId ? 67 : 47) + 8 * dataBytes;
+        }
+
         private void StoreTxEvent(TxMessageElement message)
         {
             if(txEventFIFOFull.Value)
@@ -534,29 +691,8 @@ namespace Antmicro.Renode.Peripherals.CAN
 
         private void StoreReceivedMessage(CANMessageFrame message, int rxFifo, int filterIndex, bool nonMatchingFrame = false, bool highPriority = false)
         {
-            lock(rxFIFOBuffers[rxFifo])
-            {
-                if(rxFIFOFull[rxFifo].Value || rxFIFOBuffers[rxFifo].Any())
-                {
-                    // The FIFO is full, so we buffer the function call to be executed later by the managed dequeuer thread
-                    rxFIFOBuffers[rxFifo].Enqueue(() =>
-                    {
-                        if(!TryStoreReceivedMessageInner(message, rxFifo, filterIndex, nonMatchingFrame, highPriority))
-                        {
-                            throw new InvalidOperationException("Somehow failed to store message in a FIFO with space!");
-                        }
-                    });
-                    rxDequeueThread.Start();
-                }
-                else
-                {
-                    // If the fifo is not full, we store the message immediatly
-                    if(!TryStoreReceivedMessageInner(message, rxFifo, filterIndex, nonMatchingFrame, highPriority))
-                    {
-                        throw new InvalidOperationException("Somehow failed to store message in a FIFO with space!");
-                    }
-                }
-            }
+            // A frame for a full FIFO is lost or overwrites the oldest element, see TryStoreReceivedMessageInner
+            TryStoreReceivedMessageInner(message, rxFifo, filterIndex, nonMatchingFrame, highPriority);
         }
 
         private bool TryStoreReceivedMessageInner(CANMessageFrame message, int rxFifo, int filterIndex, bool nonMatchingFrame = false, bool highPriority = false)
@@ -708,6 +844,12 @@ namespace Antmicro.Renode.Peripherals.CAN
         private void UpdateTimerConfiguration()
         {
             // Called whenever some prescaler or frequency changes
+            if(kernelFrequency == 0)
+            {
+                // No kernel clock: the counters do not count
+                timestampCounter.Enabled = false;
+                return;
+            }
             timestampCounter.Frequency = GetTCPFrequency();
             timeoutCounter.Frequency = GetTCPFrequency();
             if(timestampMode.Value == TimestampMode.TCP)
@@ -786,15 +928,8 @@ namespace Antmicro.Renode.Peripherals.CAN
                 {
                     timeoutCounter.Enabled = timeoutCounterEnable.Value;
                 }
-                // If any tx requests where started while in bus-off state, execute them here
-                if(requestPendingFlags.Value != 0)
-                {
-                    BitHelper.ForeachActiveBit(requestPendingFlags.Value, SendBuffer);
-                    requestPendingFlags.Value = 0;
-                    interruptStatusFlags[(long)Interrupts.TxFIFOEmpty].Value = true;
-                    interruptStatusFlags[(long)Interrupts.TransmissionCompleted].Value = true;
-                    UpdateInterrupts();
-                }
+                // Transmission requests added in initialization mode start now
+                StartNextTransmission();
             }
         }
 
@@ -879,12 +1014,22 @@ namespace Antmicro.Renode.Peripherals.CAN
         private readonly IFlagRegisterField[] rxFIFOFull;
         private readonly IValueRegisterField[] rxFIFOPutIndex;
         private readonly IValueRegisterField[] rxFIFOGetIndex;
-        private readonly Queue<Action>[] rxFIFOBuffers;
-        private readonly IManagedThread rxDequeueThread;
         private readonly ArrayMemory messageRam;
         private readonly LimitTimer timestampCounter;
         private readonly LimitTimer timeoutCounter;
-        private readonly uint kernelFrequency;
+        private ulong kernelFrequency;
+        private bool transmissionInProgress;
+        private ulong transmissionGeneration;
+        private ulong txFIFOGetIndex;
+        private ulong txFIFOPutIndex;
+        private IFlagRegisterField[] cancellationFinishedFlags;
+        private IFlagRegisterField[] cancellationFinishedInterruptEnableFlags;
+        private byte transmittedBuffer;
+
+        private ulong TxPutIndex => txFIFOQueueModeFlag.Value ? FirstFreeTxBuffer() : txFIFOPutIndex;
+
+        private const ulong AllTxBuffers = 0x7;
+        private const int TxBufferCount = 3;
 
         private const int MessageBufferHeaderSize = 8;
         private const int MessageBufferMaxDataBytes = 64;

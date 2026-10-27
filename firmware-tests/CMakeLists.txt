@@ -35,6 +35,22 @@ if(STM32CUBE_FIRMWARE)
     add_stm32cube_firmware(hal-spi-dma-loopback stm32cube/spi-dma-loopback/main.c
         stm32cube/common/clock_160mhz.c)
     add_stm32cube_firmware(hal-uart-dma stm32cube/uart-dma/main.c stm32cube/common/clock_160mhz.c)
+    add_stm32cube_firmware(hal-uart-dma-circular stm32cube/uart-dma-circular/main.c
+        stm32cube/common/clock_160mhz.c)
+    add_stm32cube_firmware(hal-rtc stm32cube/rtc/main.c stm32cube/common/clock_160mhz.c)
+    add_stm32cube_firmware(hal-adc stm32cube/adc/main.c stm32cube/common/clock_160mhz.c)
+    add_stm32cube_firmware(hal-flash stm32cube/flash/main.c stm32cube/common/clock_160mhz.c)
+    # Two nodes of one FDCAN firmware for a Renode CAN hub.
+    add_stm32cube_firmware(hal-fdcan-tx stm32cube/fdcan-node/main.c stm32cube/common/clock_160mhz.c)
+    target_compile_definitions(hal-fdcan-tx PRIVATE NODE_TX)
+    add_stm32cube_firmware(hal-fdcan-rx stm32cube/fdcan-node/main.c stm32cube/common/clock_160mhz.c)
+    target_compile_definitions(hal-fdcan-rx PRIVATE NODE_RX)
+    # Receiver that starts reading only after 20 ms: the Rx FIFO overflows.
+    add_stm32cube_firmware(hal-fdcan-rx-slow stm32cube/fdcan-node/main.c stm32cube/common/clock_160mhz.c)
+    target_compile_definitions(hal-fdcan-rx-slow PRIVATE NODE_RX RX_READ_DELAY_MS=20)
+    # TIM6 as the HAL time base: the unmodified template of the HAL driver.
+    add_stm32cube_firmware(hal-tim stm32cube/tim/main.c stm32cube/common/clock_160mhz.c
+        ${st_hal_SOURCE_DIR}/Src/stm32u5xx_hal_timebase_tim_template.c)
 
     # Official ST example projects, built unmodified.
     include(${CMAKE_CURRENT_LIST_DIR}/cmake/st-examples.cmake)

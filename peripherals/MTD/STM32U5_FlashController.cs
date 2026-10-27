@@ -15,16 +15,24 @@
 // "ST production value".
 //
 // Limitations:
-// - Programming is not modelled: the flash memory accepts bus writes regardless of PG, and
-//   programming errors (PROGERR, SIZERR, PGAERR, WRPERR) are never reported.
+// - Programming: while PG is set, the CPU writes to the flash memory are checked (quad-word or
+//   burst alignment, 32-bit accesses, target erased or programmed to zero) and PROGERR, SIZERR,
+//   PGAERR, PGSERR and EOP are set as in RM0456 section 7.3.9. The data is written to the memory
+//   also when an error is reported, and writes while PG is cleared are neither checked nor
+//   blocked. WRPERR (write protection) is not reported.
 // - Erase completes immediately (BSY is always 0). Option byte modification, OBL_LAUNCH,
 //   bank swapping, secure and privileged access control, ECC and power-down are not modelled.
 //
 
+using System.Collections.Generic;
+using System.Linq;
+
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Logging.Profiling;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.Memory;
 
 namespace Antmicro.Renode.Peripherals.MTD
@@ -50,6 +58,11 @@ namespace Antmicro.Renode.Peripherals.MTD
             optionLock.Reset();
             base.Reset();
             IRQ.Unset();
+            // PG is cleared by the reset without its change callback
+            if(programmingHookSet)
+            {
+                HandleProgrammingEnableChange(false);
+            }
         }
 
         public override void WriteDoubleWord(long offset, uint value)
@@ -119,10 +132,10 @@ namespace Antmicro.Renode.Peripherals.MTD
                 .WithFlag(0, out endOfOperation, FieldMode.Read | FieldMode.WriteOneToClear, name: "EOP")
                 .WithFlag(1, out operationError, FieldMode.Read | FieldMode.WriteOneToClear, name: "OPERR")
                 .WithReservedBits(2, 1)
-                .WithFlag(3, FieldMode.Read | FieldMode.WriteOneToClear, name: "PROGERR")
+                .WithFlag(3, out programmingError, FieldMode.Read | FieldMode.WriteOneToClear, name: "PROGERR")
                 .WithFlag(4, FieldMode.Read | FieldMode.WriteOneToClear, name: "WRPERR")
-                .WithFlag(5, FieldMode.Read | FieldMode.WriteOneToClear, name: "PGAERR")
-                .WithFlag(6, FieldMode.Read | FieldMode.WriteOneToClear, name: "SIZERR")
+                .WithFlag(5, out alignmentError, FieldMode.Read | FieldMode.WriteOneToClear, name: "PGAERR")
+                .WithFlag(6, out sizeError, FieldMode.Read | FieldMode.WriteOneToClear, name: "SIZERR")
                 .WithFlag(7, out programmingSequenceError, FieldMode.Read | FieldMode.WriteOneToClear, name: "PGSERR")
                 .WithReservedBits(8, 5)
                 .WithFlag(13, FieldMode.Read | FieldMode.WriteOneToClear, name: "OPTWERR")
@@ -155,14 +168,14 @@ namespace Antmicro.Renode.Peripherals.MTD
 
             // RM0456 section 7.9.9, reset 0xC000 0000 (LOCK and OPTLOCK set).
             Registers.NSCR.Define(this, 0x00000000, name: "FLASH_NSCR")
-                .WithFlag(0, name: "PG")
+                .WithFlag(0, out programmingEnabled, changeCallback: (_, value) => HandleProgrammingEnableChange(value), name: "PG")
                 .WithFlag(1, out pageErase, name: "PER")
                 .WithFlag(2, out massEraseBank1, name: "MER1")
                 .WithValueField(3, 7, out pageNumber, name: "PNB")
                 .WithReservedBits(10, 1)
                 .WithFlag(11, out bankSelect, name: "BKER")
                 .WithReservedBits(12, 2)
-                .WithFlag(14, name: "BWR")
+                .WithFlag(14, out burstProgramming, name: "BWR")
                 .WithFlag(15, out massEraseBank2, name: "MER2")
                 .WithFlag(16, out eraseStart, name: "STRT")
                 .WithFlag(17, FieldMode.Read | FieldMode.Write, valueProviderCallback: _ => false, writeCallback: (_, value) =>
@@ -502,11 +515,13 @@ namespace Antmicro.Renode.Peripherals.MTD
             {
                 this.DebugLog("Erasing bank 1");
                 memory.ZeroRange(0, bankSize);
+                ForgetProgrammedQuadWords(0, bankSize);
             }
             if(massEraseBank2.Value)
             {
                 this.DebugLog("Erasing bank 2");
                 memory.ZeroRange(bankSize, bankSize);
+                ForgetProgrammedQuadWords(bankSize, bankSize);
             }
             if(pageErase.Value && !massEraseBank1.Value && !massEraseBank2.Value)
             {
@@ -520,6 +535,7 @@ namespace Antmicro.Renode.Peripherals.MTD
                 }
                 this.DebugLog("Erasing page {0} of bank {1}", pageNumber.Value, bankSelect.Value ? 2 : 1);
                 memory.ZeroRange(offset, PageSize);
+                ForgetProgrammedQuadWords(offset, PageSize);
             }
 
             if(endOfOperationInterruptEnable.Value)
@@ -527,6 +543,156 @@ namespace Antmicro.Renode.Peripherals.MTD
                 endOfOperation.Value = true;
             }
             UpdateInterrupt();
+        }
+
+        // Programming (RM0456 section 7.3.7): while PG is set, the writes of the CPU to the flash
+        // memory are observed through a memory access hook, as in STM32H7_FlashController. The
+        // hook runs after the write, so the data reaches the memory in any case; the hook checks
+        // the sequence and sets the error flags of RM0456 section 7.3.9. Writes while PG is
+        // cleared are not observed.
+        private void HandleProgrammingEnableChange(bool value)
+        {
+            var cpus = machine.GetSystemBus(this).GetCPUs().OfType<ICPUWithMemoryAccessHooks>();
+            foreach(var cpu in cpus)
+            {
+                cpu.SetHookAtMemoryAccess(value ? (MemoryAccessHook)OnMemoryProgramWrite : null);
+            }
+            programmingHookSet = value;
+            programBufferCount = 0;
+        }
+
+        private void OnMemoryProgramWrite(ulong _, MemoryOperation operation, ulong __, ulong physicalAddress, uint width, ulong value)
+        {
+            if(operation != MemoryOperation.MemoryWrite)
+            {
+                return;
+            }
+            var bus = machine.GetSystemBus(this);
+            if(bus.WhatIsAt(physicalAddress)?.Peripheral != memory)
+            {
+                return;
+            }
+            var offset = (long)(physicalAddress - bus.GetRegistrationPoints(memory).First().Range.StartAddress);
+            HandleProgramWrite(offset, width, (uint)value);
+        }
+
+        private void HandleProgramWrite(long offset, uint width, uint value)
+        {
+            // A write after a programming error is a sequence error
+            if(programmingError.Value || alignmentError.Value || sizeError.Value || programmingSequenceError.Value)
+            {
+                ReportProgrammingError(programmingSequenceError, "write after a previous programming error");
+                return;
+            }
+            // Only 32-bit data can be written
+            if(width != 4)
+            {
+                ReportProgrammingError(sizeError, "{0}-byte write", width);
+                return;
+            }
+            // Quad-word programming, or 8 quad-words in burst mode
+            var groupSize = burstProgramming.Value ? BurstSize : QuadWordSize;
+            if(programBufferCount == 0)
+            {
+                if(offset % groupSize != 0)
+                {
+                    ReportProgrammingError(alignmentError, "first word at 0x{0:X} not aligned to {1} bytes", offset, groupSize);
+                    return;
+                }
+                programBufferStart = offset;
+            }
+            else if(offset != programBufferStart + programBufferCount)
+            {
+                ReportProgrammingError(alignmentError, "word at 0x{0:X} does not follow the previous one", offset);
+                return;
+            }
+
+            var quadWord = offset & ~(long)(QuadWordSize - 1);
+            if(offset == quadWord)
+            {
+                // The other words of the quad-word are not written yet
+                quadWordWasErased = IsErased(quadWord);
+                quadWordWasZero = IsZero(quadWord);
+                quadWordIsZero = true;
+            }
+            quadWordIsZero &= value == 0;
+            programBufferCount += (int)width;
+
+            if(offset + width == quadWord + QuadWordSize)
+            {
+                // A quad-word that is not erased can only be programmed to all zeros, once
+                if(!quadWordWasErased && (!quadWordIsZero || quadWordWasZero))
+                {
+                    ReportProgrammingError(programmingError, "quad-word at 0x{0:X} is not erased", quadWord);
+                    return;
+                }
+                programmedQuadWords[quadWord] = quadWordIsZero;
+                this.DebugLog("Programmed quad-word at offset 0x{0:X} of the flash memory", quadWord);
+            }
+            if(programBufferCount == groupSize)
+            {
+                programBufferCount = 0;
+                if(endOfOperationInterruptEnable.Value)
+                {
+                    endOfOperation.Value = true;
+                }
+                UpdateInterrupt();
+            }
+        }
+
+        // The state of a quad-word before the current write: known if it was programmed since the
+        // last erase, otherwise taken from the words that are not written yet (the first word is
+        // assumed to match them).
+        private bool IsErased(long quadWord)
+        {
+            if(programmedQuadWords.ContainsKey(quadWord))
+            {
+                return false;
+            }
+            for(var i = 4; i < QuadWordSize; i += 4)
+            {
+                if(memory.ReadDoubleWord(quadWord + i) != ErasedWord)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private bool IsZero(long quadWord)
+        {
+            if(programmedQuadWords.TryGetValue(quadWord, out var zero))
+            {
+                return zero;
+            }
+            for(var i = 4; i < QuadWordSize; i += 4)
+            {
+                if(memory.ReadDoubleWord(quadWord + i) != 0)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private void ReportProgrammingError(IFlagRegisterField flag, string reason, params object[] arguments)
+        {
+            this.Log(LogLevel.Warning, "Flash programming error: " + reason, arguments);
+            flag.Value = true;
+            programBufferCount = 0;
+            if(errorInterruptEnable.Value)
+            {
+                operationError.Value = true;
+            }
+            UpdateInterrupt();
+        }
+
+        private void ForgetProgrammedQuadWords(long start, long size)
+        {
+            foreach(var quadWord in programmedQuadWords.Keys.Where(x => x >= start && x < start + size).ToList())
+            {
+                programmedQuadWords.Remove(quadWord);
+            }
         }
 
         private void UpdateInterrupt()
@@ -539,6 +705,20 @@ namespace Antmicro.Renode.Peripherals.MTD
         private IFlagRegisterField endOfOperation;
         private IFlagRegisterField operationError;
         private IFlagRegisterField programmingSequenceError;
+        private IFlagRegisterField programmingError;
+        private IFlagRegisterField alignmentError;
+        private IFlagRegisterField sizeError;
+        private IFlagRegisterField programmingEnabled;
+        private IFlagRegisterField burstProgramming;
+        private int programBufferCount;
+        private bool programmingHookSet;
+        private long programBufferStart;
+        private bool quadWordWasErased;
+        private bool quadWordWasZero;
+        private bool quadWordIsZero;
+
+        // Quad-words programmed since the last erase; the value tells whether all bits are zero
+        private readonly Dictionary<long, bool> programmedQuadWords = new Dictionary<long, bool>();
         private IFlagRegisterField pageErase;
         private IFlagRegisterField massEraseBank1;
         private IFlagRegisterField massEraseBank2;
@@ -553,6 +733,9 @@ namespace Antmicro.Renode.Peripherals.MTD
         private readonly LockRegister optionLock;
 
         private const byte ErasedByte = 0xFF;
+        private const uint ErasedWord = 0xFFFFFFFF;
+        private const int QuadWordSize = 16;
+        private const int BurstSize = 8 * QuadWordSize;
         // 8 Kbytes (stm32u575xx.h FLASH_PAGE_SIZE).
         private const long PageSize = 0x2000;
         private const uint LockBit = 1u << 31;

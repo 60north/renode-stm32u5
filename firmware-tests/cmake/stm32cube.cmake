@@ -42,7 +42,9 @@ set(STM32CUBE_INCLUDES
     ${st_cmsis_core_SOURCE_DIR}/Include)
 
 set(hal_modules hal hal_cortex hal_rcc hal_rcc_ex hal_pwr hal_pwr_ex hal_flash hal_flash_ex
-    hal_icache hal_gpio hal_dma hal_dma_ex hal_exti hal_uart hal_uart_ex hal_spi hal_spi_ex)
+    hal_icache hal_gpio hal_dma hal_dma_ex hal_exti hal_uart hal_uart_ex hal_spi hal_spi_ex
+    hal_tim hal_tim_ex hal_rtc hal_rtc_ex
+    hal_adc hal_adc_ex hal_fdcan)
 set(hal_sources)
 foreach(module ${hal_modules})
     list(APPEND hal_sources ${st_hal_SOURCE_DIR}/Src/stm32u5xx_${module}.c)

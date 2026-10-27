@@ -19,6 +19,8 @@
 // - Clock security systems, MSI PLL mode, Stop/Standby behaviour and peripheral resets through
 //   the *RSTR registers are not modelled. Enable and sleep-mode enable registers are storage.
 // - The SysTick always counts the processor clock (HCLK); RCC_CCIPR1.SYSTICKSEL is storage.
+// - Timer clocks are pushed to the timers given to the constructor: the APB clock if the APB
+//   prescaler is 1, else twice the APB clock (RM0456 section 11.4.15).
 //
 
 using System;
@@ -36,7 +38,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public STM32U5_RCC(IMachine machine, IHasFrequency nvic = null, STM32U5_PWR pwr = null,
             ulong hseFrequency = 0, ulong lseFrequency = 0, ulong lsiFrequency = DefaultLsiFrequency,
             IHasFrequency usart1 = null, IHasFrequency usart2 = null, IHasFrequency usart3 = null,
-            IHasFrequency uart4 = null, IHasFrequency uart5 = null, IHasFrequency lpuart1 = null) : base(machine)
+            IHasFrequency uart4 = null, IHasFrequency uart5 = null, IHasFrequency lpuart1 = null,
+            IHasFrequency tim1 = null, IHasFrequency tim2 = null, IHasFrequency tim3 = null, IHasFrequency tim4 = null,
+            IHasFrequency tim5 = null, IHasFrequency tim6 = null, IHasFrequency tim7 = null, IHasFrequency tim8 = null,
+            IHasFrequency tim15 = null, IHasFrequency tim16 = null, IHasFrequency tim17 = null,
+            IHasFrequency fdcan1 = null) : base(machine)
         {
             this.nvic = nvic;
             this.pwr = pwr;
@@ -45,12 +51,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             this.lsiFrequency = lsiFrequency;
             serialPorts = new[] { usart1, usart2, usart3, uart4, uart5 };
             this.lpuart1 = lpuart1;
+            apb1Timers = new[] { tim2, tim3, tim4, tim5, tim6, tim7 };
+            apb2Timers = new[] { tim1, tim8, tim15, tim16, tim17 };
+            this.fdcan1 = fdcan1;
             IRQ = new GPIO();
             pllOn = new IFlagRegisterField[PllCount];
             pllSource = new IValueRegisterField[PllCount];
             pllPrescaler = new IValueRegisterField[PllCount];
             pllFractionalEnable = new IFlagRegisterField[PllCount];
             pllROutputEnable = new IFlagRegisterField[PllCount];
+            pllPOutputEnable = new IFlagRegisterField[PllCount];
+            pllQOutputEnable = new IFlagRegisterField[PllCount];
             pllMultiplier = new IValueRegisterField[PllCount];
             pllDividerP = new IValueRegisterField[PllCount];
             pllDividerQ = new IValueRegisterField[PllCount];
@@ -755,7 +766,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 .WithValueField(18, 2, name: "LPTIM2SEL")
                 .WithValueField(20, 2, name: "SPI1SEL")
                 .WithValueField(22, 2, name: "SYSTICKSEL")
-                .WithValueField(24, 2, name: "FDCANSEL")
+                .WithValueField(24, 2, out fdcanClockSelection, name: "FDCANSEL")
                 .WithValueField(26, 2, name: "ICLKSEL")
                 .WithReservedBits(28, 1)
                 .WithValueField(29, 3, name: "TIMICSEL")
@@ -792,8 +803,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             ;
 
             // RM0456 section 11.8.49, backup domain reset value 0x0000 0000 (STM32U575/585).
-            // Write-protected by PWR_DBPR.DBP, see WriteDoubleWord.
-            Registers.BDCR.Define(this, 0x00000000, name: "RCC_BDCR")
+            // Write-protected by PWR_DBPR.DBP, see WriteDoubleWord. In the backup domain: not
+            // changed by a system reset (only BDRST clears the backup domain bits).
+            Registers.BDCR.Define(this, 0x00000000, softResettable: false, name: "RCC_BDCR")
                 .WithFlag(0, out lseOn, name: "LSEON")
                 .WithFlag(1, FieldMode.Read, valueProviderCallback: _ => LseReady, name: "LSERDY")
                 .WithFlag(2, name: "LSEBYP")
@@ -884,8 +896,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 configurationRegister.WithReservedBits(12, 4);
             }
             configurationRegister
-                .WithFlag(16, name: $"{prefix}PEN")
-                .WithFlag(17, name: $"{prefix}QEN")
+                .WithFlag(16, out pllPOutputEnable[index], name: $"{prefix}PEN")
+                .WithFlag(17, out pllQOutputEnable[index], name: $"{prefix}QEN")
                 .WithFlag(18, out pllROutputEnable[index], name: $"{prefix}REN")
                 .WithReservedBits(19, 13)
                 .WithChangeCallback((_, __) => UpdateClocks());
@@ -1005,14 +1017,30 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // VCO = input / M * (N + FRACN / 2^13); pll_r_ck = VCO / R (RM0456 sections 11.8.9-11.8.13).
         private ulong PllROutput(int index)
         {
-            if(!PllReady(index) || !pllROutputEnable[index].Value)
+            return PllOutput(index, pllROutputEnable[index], pllDividerR[index]);
+        }
+
+        // pll_p_ck = VCO / P, pll_q_ck = VCO / Q
+        private ulong PllPOutput(int index)
+        {
+            return PllOutput(index, pllPOutputEnable[index], pllDividerP[index]);
+        }
+
+        private ulong PllQOutput(int index)
+        {
+            return PllOutput(index, pllQOutputEnable[index], pllDividerQ[index]);
+        }
+
+        private ulong PllOutput(int index, IFlagRegisterField outputEnable, IValueRegisterField divider)
+        {
+            if(!PllReady(index) || !outputEnable.Value)
             {
                 return 0;
             }
             var fractional = pllFractionalEnable[index].Value ? pllFraction[index].Value : 0;
             var multiplier = (pllMultiplier[index].Value + 1) * 8192 + fractional;
             var vco = (ulong)((decimal)PllInputFrequency(index) / (pllPrescaler[index].Value + 1) * multiplier / 8192);
-            return vco / (pllDividerR[index].Value + 1);
+            return vco / (divider.Value + 1);
         }
 
         private bool MsisReady => msisOn.Value;
@@ -1093,6 +1121,56 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 nvic.Frequency = AhbClock;
             }
             UpdateSerialKernelClocks();
+            UpdateTimerClocks();
+            UpdateFdcanKernelClock();
+        }
+
+        private void UpdateTimerClocks()
+        {
+            if(apb1Timers == null)
+            {
+                return;
+            }
+            SetTimerClock(apb1Timers, apb1Prescaler.Value, Apb1Frequency);
+            SetTimerClock(apb2Timers, apb2Prescaler.Value, Apb2Frequency);
+        }
+
+        // Timer clock: the APB clock if the APB prescaler is 1, else twice the APB clock
+        // (RM0456 section 11.4.15).
+        private static void SetTimerClock(IHasFrequency[] timers, ulong ppre, ulong pclk)
+        {
+            var frequency = (ppre & 4) == 0 ? pclk : pclk * 2;
+            foreach(var timer in timers)
+            {
+                if(timer != null)
+                {
+                    timer.Frequency = frequency;
+                }
+            }
+        }
+
+        // FDCAN1SEL in RCC_CCIPR1: 00 HSE, 01 PLL1Q, 10 PLL2P, 11 reserved (RM0456 section 11.8.46).
+        private void UpdateFdcanKernelClock()
+        {
+            if(fdcan1 == null || fdcanClockSelection == null)
+            {
+                return;
+            }
+            switch(fdcanClockSelection.Value)
+            {
+            case 0:
+                fdcan1.Frequency = HseReady ? hseFrequency : 0;
+                break;
+            case 1:
+                fdcan1.Frequency = PllQOutput(0);
+                break;
+            case 2:
+                fdcan1.Frequency = PllPOutput(1);
+                break;
+            default:
+                fdcan1.Frequency = 0;
+                break;
+            }
         }
 
         // USARTxSEL/UARTxSEL in RCC_CCIPR1: 00 PCLK (PCLK2 for USART1, PCLK1 otherwise), 01 SYSCLK,
@@ -1214,6 +1292,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly IValueRegisterField[] pllPrescaler;
         private readonly IFlagRegisterField[] pllFractionalEnable;
         private readonly IFlagRegisterField[] pllROutputEnable;
+        private readonly IFlagRegisterField[] pllPOutputEnable;
+        private readonly IFlagRegisterField[] pllQOutputEnable;
         private readonly IValueRegisterField[] pllMultiplier;
         private readonly IValueRegisterField[] pllDividerP;
         private readonly IValueRegisterField[] pllDividerQ;
@@ -1235,6 +1315,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly ulong lsiFrequency;
         private readonly IHasFrequency[] serialPorts;
         private readonly IHasFrequency lpuart1;
+        private readonly IHasFrequency[] apb1Timers;
+        private readonly IHasFrequency[] apb2Timers;
+        private readonly IHasFrequency fdcan1;
+        private IValueRegisterField fdcanClockSelection;
         private readonly IValueRegisterField[] serialClockSelection = new IValueRegisterField[5];
         private IValueRegisterField lpuartClockSelection;
         private IFlagRegisterField hsiKernelOn;

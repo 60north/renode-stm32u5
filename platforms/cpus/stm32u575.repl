@@ -57,6 +57,28 @@ sysbus:
 // Peripheral base addresses: stm32u575xx.h *_BASE_NS; interrupt numbers: IRQn_Type.
 pwr: Miscellaneous.STM32U5_PWR @ sysbus 0x46020800
 
+// Device identification for the HAL: STM32U575/585, revision W (SVD reset value).
+dbgmcu: Miscellaneous.STM32U5_DBGMCU @ sysbus 0xE0044000
+
+// ADC1 (14-bit); VREF+ assumed 3.3 V; conversions are triggered by software or at 1 kHz for
+// external triggers; ADC4 and the DMA request are not modelled.
+adc1: Analog.STM32U5_ADC @ sysbus 0x42028000
+    referenceVoltage: 3.3
+    externalEventFrequency: 1000
+    -> nvic@37
+
+// Clocked by the LSI (32 kHz); the early wake-up interrupt (IRQ 27) is not modelled.
+iwdg: Timers.STM32U5_IWDG @ sysbus 0x40003000
+    frequency: 32000
+    windowOption: true
+
+// RTC clock is assumed to be 32768 Hz (LSE).
+rtc: Timers.STM32U5_RTC @ sysbus 0x46007800
+    IRQ -> nvic@2
+
+// Backup registers only.
+tamp: Miscellaneous.STM32U5_TAMP @ sysbus 0x46007C00
+
 // HSE and LSE are board components: set hseFrequency/lseFrequency in the board description.
 rcc: Miscellaneous.STM32U5_RCC @ sysbus 0x46020C00
     nvic: nvic
@@ -67,6 +89,18 @@ rcc: Miscellaneous.STM32U5_RCC @ sysbus 0x46020C00
     uart4: uart4
     uart5: uart5
     lpuart1: lpuart1
+    tim1: tim1
+    tim2: tim2
+    tim3: tim3
+    tim4: tim4
+    tim5: tim5
+    tim6: tim6
+    tim7: tim7
+    tim8: tim8
+    tim15: tim15
+    tim16: tim16
+    tim17: tim17
+    fdcan1: fdcan1
     IRQ -> nvic@9
 
 flashController: MTD.STM32U5_FlashController @ sysbus 0x40022000
@@ -223,3 +257,66 @@ gpdma1: DMA.STM32U5_GPDMA @ sysbus 0x40020000
     numberOfChannels: 16
     [0-7] -> nvic@[29-36]
     [8-15] -> nvic@[80-87]
+
+// Timers (STM32U5_Timer). TIM2-TIM5 have 32-bit counters, the others 16-bit (RM0456
+// Table 556). The clock is set by RCC; the initial value is the reset PCLK.
+tim1: Timers.STM32U5_Timer @ sysbus 0x40012C00
+    frequency: 4000000
+    initialLimit: 0xFFFF
+    BreakInterrupt -> nvic@41
+    UpdateInterrupt -> nvic@42
+    [TriggerInterrupt, CommutationInterrupt] -> nvic@[43, 43]
+    CaptureCompareInterrupt -> nvic@44
+
+tim2: Timers.STM32U5_Timer @ sysbus 0x40000000
+    frequency: 4000000
+    initialLimit: 0xFFFFFFFF
+    -> nvic@45
+
+tim3: Timers.STM32U5_Timer @ sysbus 0x40000400
+    frequency: 4000000
+    initialLimit: 0xFFFFFFFF
+    -> nvic@46
+
+tim4: Timers.STM32U5_Timer @ sysbus 0x40000800
+    frequency: 4000000
+    initialLimit: 0xFFFFFFFF
+    -> nvic@47
+
+tim5: Timers.STM32U5_Timer @ sysbus 0x40000C00
+    frequency: 4000000
+    initialLimit: 0xFFFFFFFF
+    -> nvic@48
+
+tim6: Timers.STM32U5_Timer @ sysbus 0x40001000
+    frequency: 4000000
+    initialLimit: 0xFFFF
+    -> nvic@49
+
+tim7: Timers.STM32U5_Timer @ sysbus 0x40001400
+    frequency: 4000000
+    initialLimit: 0xFFFF
+    -> nvic@50
+
+tim8: Timers.STM32U5_Timer @ sysbus 0x40013400
+    frequency: 4000000
+    initialLimit: 0xFFFF
+    BreakInterrupt -> nvic@51
+    UpdateInterrupt -> nvic@52
+    [TriggerInterrupt, CommutationInterrupt] -> nvic@[53, 53]
+    CaptureCompareInterrupt -> nvic@54
+
+tim15: Timers.STM32U5_Timer @ sysbus 0x40014000
+    frequency: 4000000
+    initialLimit: 0xFFFF
+    -> nvic@69
+
+tim16: Timers.STM32U5_Timer @ sysbus 0x40014400
+    frequency: 4000000
+    initialLimit: 0xFFFF
+    -> nvic@70
+
+tim17: Timers.STM32U5_Timer @ sysbus 0x40014800
+    frequency: 4000000
+    initialLimit: 0xFFFF
+    -> nvic@71

@@ -27,6 +27,9 @@ ${UE}               0x00000001
 ${RE}               0x00000004
 ${TE}               0x00000008
 ${FIFOEN}           0x20000000
+${IDLE}             0x00000010
+${IDLEIE}           0x00000010
+${IDLECF}           0x00000010
 ${RXNE}             0x00000020
 ${TC}               0x00000040
 ${TXFE}             0x00800000
@@ -137,6 +140,26 @@ Should Receive Characters
     Receive Characters              Z
     USART Bits Should Be Set        ${USART1}    ${ISR}      ${RXNE}
     USART Should Be                 ${USART1}    ${RDR}      0x5A
+
+Should Detect An Idle Line After Reception
+    [Documentation]                 RM0456 66.8.10: IDLE after a reception, interrupt with IDLEIE,
+    ...                             cleared by IDLECF, set again only after new data.
+    Write USART                     ${USART1}    ${BRR}      35
+    ${value}=                       Evaluate           ${UE} | ${RE} | ${IDLEIE}
+    Write USART                     ${USART1}    ${CR1}      ${value}
+    Execute Command                 emulation RunFor "0.01"
+    USART Bits Should Be Clear      ${USART1}    ${ISR}      ${IDLE}
+    Interrupt Line Should Be        usart1             False
+    Receive Characters              Z
+    USART Bits Should Be Set        ${USART1}    ${ISR}      ${IDLE}
+    Interrupt Line Should Be        usart1             True
+    Write USART                     ${USART1}    ${ICR}      ${IDLECF}
+    USART Bits Should Be Clear      ${USART1}    ${ISR}      ${IDLE}
+    Interrupt Line Should Be        usart1             False
+    Execute Command                 emulation RunFor "0.01"
+    USART Bits Should Be Clear      ${USART1}    ${ISR}      ${IDLE}
+    Receive Characters              Y
+    USART Bits Should Be Set        ${USART1}    ${ISR}      ${IDLE}
 
 Should Report FIFO Thresholds And Full FIFO
     Write USART                     ${USART1}    ${BRR}      35

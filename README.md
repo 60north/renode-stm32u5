@@ -7,8 +7,11 @@ Platform description, peripheral models and tests for running STM32U575 firmware
 
 - `platforms/cpus/stm32u575.repl` - STM32U575 platform; `platforms/boards/` - NUCLEO-U575ZI-Q and
   STM32U575I-EV (LEDs and user button).
-- `peripherals/` - peripheral models: RCC, PWR, flash interface, ICACHE, GPIO, EXTI, USART, SPI,
-  I2C, FDCAN, GPDMA. Each file names the Renode model it was adapted from.
+- `peripherals/` - peripheral models: RCC, PWR, flash interface (with programming checks),
+  ICACHE, GPIO, EXTI, USART (with idle line detection), SPI, I2C, FDCAN (Classic CAN timing, Tx
+  and Rx FIFOs, CAN hub), GPDMA (with linked-list mode), timers TIM1-8 and TIM15-17, RTC with the
+  TAMP backup registers, IWDG, ADC1 and DBGMCU. Each file names the Renode model it was adapted
+  from.
 - `scripts/load-models.resc` - compiles the models in Renode (`include`), before the platform is
   loaded.
 - `firmware-tests/` - test firmware (CMake): bare-metal programs, programs using the STM32CubeU5

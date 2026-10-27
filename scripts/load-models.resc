@@ -12,3 +12,9 @@ include $ORIGIN/../peripherals/SPI/STM32U5_SPI.cs
 include $ORIGIN/../peripherals/I2C/STM32U5_I2C.cs
 include $ORIGIN/../peripherals/CAN/STM32U5_FDCAN.cs
 include $ORIGIN/../peripherals/DMA/STM32U5_GPDMA.cs
+include $ORIGIN/../peripherals/Timers/STM32U5_Timer.cs
+include $ORIGIN/../peripherals/Timers/STM32U5_RTC.cs
+include $ORIGIN/../peripherals/Miscellaneous/STM32U5_TAMP.cs
+include $ORIGIN/../peripherals/Timers/STM32U5_IWDG.cs
+include $ORIGIN/../peripherals/Analog/STM32U5_ADC.cs
+include $ORIGIN/../peripherals/Miscellaneous/STM32U5_DBGMCU.cs

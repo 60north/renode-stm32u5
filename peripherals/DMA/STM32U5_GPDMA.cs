@@ -16,7 +16,9 @@
 // - Hardware requests are routed by REQSEL (7 bits); a channel with a peripheral source moves
 //   data beats while the request (a level) is asserted, other channels copy the block when
 //   enabled; EN reads 1 while the channel is active.
-// Linked-list mode, 2D addressing (channels 12-15) and the other parts marked TODO upstream are
+// - Linked-list mode (run to completion): items loaded per the update bits, BNDT restored when
+//   BR1 is not updated, TC/HT per TCEM; a circular list without hardware requests runs once.
+// Link step mode, 2D addressing (channels 12-15) and the other parts marked TODO upstream are
 // not implemented.
 //
 
@@ -37,7 +39,8 @@ namespace Antmicro.Renode.Peripherals.DMA
         public STM32U5_GPDMA(IMachine machine, int numberOfChannels)
         {
             this.machine = machine;
-            engine = new DmaEngine(machine.GetSystemBus(this));
+            sysbus = machine.GetSystemBus(this);
+            engine = new DmaEngine(sysbus);
             channels = new Channel[numberOfChannels];
             var innerConnections = new Dictionary<int, IGPIO>();
 
@@ -162,6 +165,7 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         private readonly IMachine machine;
         private readonly DmaEngine engine;
+        private readonly IBusController sysbus;
         // GPDMA_CxTR2.REQSEL selects one of 128 hardware requests
         private readonly bool[] requestAsserted = new bool[128];
         private bool servingRequests;
@@ -275,6 +279,12 @@ namespace Antmicro.Renode.Peripherals.DMA
                             if(val)
                             {
                                 active = true;
+                                if(blockNumberDataBytesFromSource.Value == 0 && !TryLoadNextLinkedListItem())
+                                {
+                                    // Nothing to transfer
+                                    active = false;
+                                    return;
+                                }
                                 if(softwareRequest.Value || destinationHardwareRequest.Value)
                                 {
                                     DoTransfer();
@@ -474,10 +484,61 @@ namespace Antmicro.Renode.Peripherals.DMA
                 //TODO: implement linked list mode
                 //TODO: implement to copy whole block if source = destination = memory
 
+                // A circular list would be copied forever: it is executed once
+                var loadedItems = new HashSet<ulong>();
                 while(active && blockNumberDataBytesFromSource.Value > 0)
                 {
+                    var itemsBefore = linkedListItemsLoaded;
                     DoBeat();
+                    if(linkedListItemsLoaded != itemsBefore && !loadedItems.Add(lastLinkedListItemAddress))
+                    {
+                        parent.Log(LogLevel.Warning, "Channel {0}: circular linked list without hardware requests executed once", channelNumber);
+                        break;
+                    }
                 }
+            }
+
+            private bool LastLinkedListItem => !updateTR1fromMemory.Value && !updateTR2fromMemory.Value
+                && !updateBR1fromMemory.Value && !updateSARfromMemory.Value && !updateDARfromMemory.Value
+                && !updateLLRfromMemory.Value && lowSignificantAddress.Value == 0;
+
+            // Link transfer: the registers selected by the update bits are read in this order from
+            // the next item (RM0456 17.4.5).
+            private bool TryLoadNextLinkedListItem()
+            {
+                if(LastLinkedListItem)
+                {
+                    return false;
+                }
+                var address = ((ulong)linkedListBaseAddress.Value << 16) | ((ulong)lowSignificantAddress.Value << 2);
+                lastLinkedListItemAddress = address;
+                linkedListItemsLoaded++;
+                var restoreBlockSize = !updateBR1fromMemory.Value;
+                var updates = new[]
+                {
+                    new { Update = updateTR1fromMemory.Value, Register = ChannelRegisters.ChannelTransfer1 },
+                    new { Update = updateTR2fromMemory.Value, Register = ChannelRegisters.ChannelTransfer2 },
+                    new { Update = updateBR1fromMemory.Value, Register = ChannelRegisters.ChannelBlock1 },
+                    new { Update = updateSARfromMemory.Value, Register = ChannelRegisters.ChannelSourceAddress },
+                    new { Update = updateDARfromMemory.Value, Register = ChannelRegisters.ChannelDestinationAddress },
+                    new { Update = updateLLRfromMemory.Value, Register = ChannelRegisters.ChannelLinkedListAddress },
+                };
+                foreach(var update in updates)
+                {
+                    if(!update.Update)
+                    {
+                        continue;
+                    }
+                    var value = parent.sysbus.ReadDoubleWord(address);
+                    address += 4;
+                    registers.Write((long)update.Register + channelNumber * ShiftBetweenChannels, value);
+                }
+                if(restoreBlockSize)
+                {
+                    // BNDT is restored to its programmed value (RM0456 17.8.12)
+                    blockNumberDataBytesFromSource.Value = originalBlockNumberDataBytesFromSource;
+                }
+                return true;
             }
 
             private void DoBeat()
@@ -495,13 +556,26 @@ namespace Antmicro.Renode.Peripherals.DMA
                 currentDestinationAddress = response.WriteAddress.Value;
 
                 // BNDT is a number of bytes, decremented by the bytes of each data beat
+                var bytesBefore = blockNumberDataBytesFromSource.Value;
                 blockNumberDataBytesFromSource.Value -= Math.Min(toCopy, blockNumberDataBytesFromSource.Value);
-                HalfTransfer = blockNumberDataBytesFromSource.Value <= originalBlockNumberDataBytesFromSource / 2;
-                TransferComplete = blockNumberDataBytesFromSource.Value == 0;
-                if(TransferComplete)
+                // TCEM = 11: the events are generated by the last linked-list item only (RM0456 17.8.11)
+                var eventsOfThisItem = transferCompleteEventMode.Value != 3 || LastLinkedListItem;
+                var half = originalBlockNumberDataBytesFromSource / 2;
+                if(eventsOfThisItem && bytesBefore > half && blockNumberDataBytesFromSource.Value <= half)
                 {
-                    // EN is cleared by hardware at the end of the block
-                    active = false;
+                    HalfTransfer = true;
+                }
+                if(blockNumberDataBytesFromSource.Value == 0)
+                {
+                    if(eventsOfThisItem)
+                    {
+                        TransferComplete = true;
+                    }
+                    if(!TryLoadNextLinkedListItem())
+                    {
+                        // EN is cleared by hardware at the end of the last item
+                        active = false;
+                    }
                 }
                 Update();
             }
@@ -537,6 +611,8 @@ namespace Antmicro.Renode.Peripherals.DMA
             }
 
             private bool active;
+            private ulong linkedListItemsLoaded;
+            private ulong lastLinkedListItemAddress;
             private ulong currentSourceAddress;
             private ulong currentDestinationAddress;
             private ulong originalBlockNumberDataBytesFromSource;
