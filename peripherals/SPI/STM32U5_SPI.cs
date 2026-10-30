@@ -20,6 +20,8 @@
 // - Limited-feature instance (SPI3, RM0456 Table 696): TSIZE[15:10] and DSIZE[4] reserved,
 //   DSIZE[2:0] fixed to 111 (8 or 16-bit frames).
 // - The receive DMA request is a level: RXDMAEN set and data in the RxFIFO.
+// - With software slave select (SSM = 1) the transaction of the slave ends when the chip select
+//   input (GPIO 0, from the chip select pin) goes high, not at the end of each transfer.
 // Limitations: master mode only; underrun, overrun, CRC errors, mode faults and the TI frame
 // format are not reported; the FIFOs are not bounded; transfers complete immediately.
 //
@@ -35,7 +37,7 @@ using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.SPI
 {
-    public class STM32U5_SPI : NullRegistrationPointPeripheralContainer<ISPIPeripheral>, IKnownSize, IDoubleWordPeripheral, IWordPeripheral, IBytePeripheral
+    public class STM32U5_SPI : NullRegistrationPointPeripheralContainer<ISPIPeripheral>, IKnownSize, IDoubleWordPeripheral, IWordPeripheral, IBytePeripheral, IGPIOReceiver
     {
         public STM32U5_SPI(IMachine machine, bool limitedFeatures = false) : base(machine)
         {
@@ -228,7 +230,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 .WithFlag(23, out leastSignificantByteFirst, name: "LSBFRST")
                 .WithFlag(24, name: "CPHA")
                 .WithFlag(25, name: "CPOL")
-                .WithFlag(26, name: "SSM")
+                .WithFlag(26, out softwareSlaveManagement, name: "SSM")
                 .WithReservedBits(27, 1)
                 .WithFlag(28, name: "SSIOP")
                 .WithFlag(29, name: "SSOE")
@@ -437,9 +439,28 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         private void EndTransfer()
         {
-            RegisteredPeripheral?.FinishTransmission();
+            if(!softwareSlaveManagement.Value)
+            {
+                RegisteredPeripheral?.FinishTransmission();
+            }
             endOfTransfer.Value = true;
             startTransmission.Value = false;
+        }
+
+        // GPIO 0: the chip select line of the slave, driven by a GPIO pin of the firmware (active
+        // low). With SSM = 1 the transaction of the slave ends when it goes high.
+        public void OnGPIO(int number, bool value)
+        {
+            if(number != ChipSelectInput)
+            {
+                this.Log(LogLevel.Warning, "Unexpected GPIO input {0}", number);
+                return;
+            }
+            if(value && !chipSelectReleased && softwareSlaveManagement.Value)
+            {
+                RegisteredPeripheral?.FinishTransmission();
+            }
+            chipSelectReleased = value;
         }
 
         private void UpdateDmaRequest()
@@ -485,6 +506,9 @@ namespace Antmicro.Renode.Peripherals.SPI
         private bool TransmissionFilled => transmissionSize.Value != 0 && transmittedPackets >= transmissionSize.Value;
 
         private bool iolockValue;
+        private bool chipSelectReleased = true;
+        private IFlagRegisterField softwareSlaveManagement;
+        private const int ChipSelectInput = 0;
         private readonly bool limitedFeatures;
         private IValueRegisterField fifoThreshold;
         private IFlagRegisterField duplexPacketInterruptEnable;

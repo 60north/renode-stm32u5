@@ -10,8 +10,8 @@ Platform description, peripheral models and tests for running STM32U575 firmware
 - `peripherals/` - peripheral models: RCC, PWR, flash interface (with programming checks),
   ICACHE, GPIO, EXTI, USART (with idle line detection), SPI, I2C, FDCAN (Classic CAN timing, Tx
   and Rx FIFOs, CAN hub), GPDMA (with linked-list mode), timers TIM1-8 and TIM15-17, RTC with the
-  TAMP backup registers, IWDG, ADC1 and DBGMCU. Each file names the Renode model it was adapted
-  from.
+  TAMP backup registers, IWDG, ADC1 and DBGMCU, and an SD card for the SPI mode. Each file names
+  the Renode model it was adapted from.
 - `scripts/load-models.resc` - compiles the models in Renode (`include`), before the platform is
   loaded.
 - `firmware-tests/` - test firmware (CMake): bare-metal programs, programs using the STM32CubeU5
@@ -40,6 +40,21 @@ using "<this repository>/platforms/boards/nucleo_u575zi_q.repl"
 
 rcc:
     lseFrequency: 32768
+```
+
+An SD card in SPI mode is attached to an SPI controller, and its chip select pin to the
+controller's chip select input. With software slave select (`SPI_NSS_SOFT`, SSM = 1) the card
+keeps its command state while the pin is low and drops it when the pin goes high:
+
+```text
+sdCard: SD.STM32U5_SDCard @ spi1
+    imageFile: "path/to/sd.img"
+    capacity: 0x100000000
+    spiMode: true
+    persistent: true
+
+gpioPortD:
+    2 -> spi1@0
 ```
 
 Inputs are driven from the Monitor, for example `sysbus.gpioPortC OnGPIO 13 true` for a pin and

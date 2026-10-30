@@ -31,6 +31,7 @@ if(STM32CUBE_FIRMWARE)
     add_stm32cube_firmware(hal-gpio stm32cube/gpio/main.c)
     add_stm32cube_firmware(hal-uart stm32cube/uart/main.c)
     add_stm32cube_firmware(hal-spi stm32cube/spi/main.c stm32cube/common/clock_160mhz.c)
+    add_stm32cube_firmware(hal-sdcard stm32cube/sdcard/main.c stm32cube/common/clock_160mhz.c)
     add_stm32cube_firmware(hal-spi-dma stm32cube/spi-dma/main.c stm32cube/common/clock_160mhz.c)
     add_stm32cube_firmware(hal-spi-dma-loopback stm32cube/spi-dma-loopback/main.c
         stm32cube/common/clock_160mhz.c)
