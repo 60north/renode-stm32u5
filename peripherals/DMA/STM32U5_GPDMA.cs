@@ -18,6 +18,11 @@
 //   enabled; EN reads 1 while the channel is active.
 // - Linked-list mode (run to completion): items loaded per the update bits, BNDT restored when
 //   BR1 is not updated, TC/HT per TCEM; a circular list without hardware requests runs once.
+// - TrustZone and privilege (RM0456 17.4.14, 17.4.15): secure and privileged channels; the
+//   registers of a secure channel read as 0 and ignore non-secure writes, with an illegal
+//   access event (GTZC1 TZIC); GPDMA_SMISR is secure, GPDMA_MISR shows the nonsecure channels.
+//   With trustZoneEnabled the data transfers carry the channel security (SSEC/DSEC) and
+//   privilege, and linked-list loads the channel security, as a transaction state of the GPDMA.
 // Link step mode, 2D addressing (channels 12-15) and the other parts marked TODO upstream are
 // not implemented.
 //
@@ -31,15 +36,23 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.CPU;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 
 namespace Antmicro.Renode.Peripherals.DMA
 {
-    public class STM32U5_GPDMA : IDoubleWordPeripheral, IKnownSize, IGPIOReceiver, INumberedGPIOOutput
+    public class STM32U5_GPDMA : IDoubleWordPeripheral, IKnownSize, IGPIOReceiver, INumberedGPIOOutput, IPeripheralWithTransactionState, ISTM32U5_TrustZoneAware
     {
-        public STM32U5_GPDMA(IMachine machine, int numberOfChannels)
+        public STM32U5_GPDMA(IMachine machine, int numberOfChannels, bool trustZoneEnabled = false,
+            STM32U5_GTZC_TZIC illegalAccessController = null, int illegalAccessRegister = 4, int illegalAccessBit = 0)
         {
             this.machine = machine;
             sysbus = machine.GetSystemBus(this);
+            this.trustZoneEnabled = trustZoneEnabled;
+            this.illegalAccessController = illegalAccessController;
+            // GTZC1_TZIC_IER4.GPDMA1IE by default; LPDMA1: GTZC2_TZIC_IER2.LPDMA1IE (register 2, bit 5)
+            this.illegalAccessRegister = illegalAccessRegister;
+            this.illegalAccessBit = illegalAccessBit;
             engine = new DmaEngine(sysbus);
             channels = new Channel[numberOfChannels];
             var innerConnections = new Dictionary<int, IGPIO>();
@@ -54,19 +67,45 @@ namespace Antmicro.Renode.Peripherals.DMA
 
             var nonsecureMaskedInteruptStatus = new DoubleWordRegister(this)
                 .WithFlags(0, channels.Length, FieldMode.Read,
-                    valueProviderCallback: (i, _) => channels[i].GlobalInterrupt,
-                    name: $"Masked interrupt status for secure channel (MISn)"
+                    valueProviderCallback: (i, _) => !channels[i].Secure && channels[i].GlobalInterrupt,
+                    name: $"Masked interrupt status of nonsecure channel (MISn)"
                 )
                 .WithReservedBits(channels.Length, 32 - channels.Length);
 
+            var secureMaskedInteruptStatus = new DoubleWordRegister(this)
+                .WithFlags(0, channels.Length, FieldMode.Read,
+                    valueProviderCallback: (i, _) => channels[i].Secure && channels[i].GlobalInterrupt,
+                    name: $"Masked interrupt status of secure channel (MISn)"
+                )
+                .WithReservedBits(channels.Length, 32 - channels.Length);
+
+            var secureConfiguration = new DoubleWordRegister(this)
+                .WithFlags(0, channels.Length, out secureChannels, name: "Secure state of channel (SECn)")
+                .WithReservedBits(channels.Length, 32 - channels.Length)
+                .WithWriteCallback((_, __) =>
+                    {
+                        // SSEC and DSEC are cleared when a channel becomes nonsecure (RM0456 17.8.10)
+                        foreach(var channel in channels)
+                        {
+                            channel.UpdateSecurityAttributes();
+                        }
+                    });
+
             var privilegedConfiguration = new DoubleWordRegister(this)
-                .WithFlags(0, channels.Length, name: "Privileged state of channel (PRIVn)")
+                .WithFlags(0, channels.Length, out privilegedChannels, name: "Privileged state of channel (PRIVn)")
+                .WithReservedBits(channels.Length, 32 - channels.Length);
+
+            var configurationLock = new DoubleWordRegister(this)
+                .WithFlags(0, channels.Length, out lockedChannels, FieldMode.Read | FieldMode.Set, name: "Lock of the channel attributes (LOCKn)")
                 .WithReservedBits(channels.Length, 32 - channels.Length);
 
             var registerMap = new Dictionary<long, DoubleWordRegister>
             {
+                {(long)Registers.SecureConfiguration, secureConfiguration},
                 {(long)Registers.PrivilegedConfiguration, privilegedConfiguration},
+                {(long)Registers.ConfigurationLock, configurationLock},
                 {(long)Registers.NonsecureMaskedInteruptStatus, nonsecureMaskedInteruptStatus},
+                {(long)Registers.SecureMaskedInteruptStatus, secureMaskedInteruptStatus},
             };
             registers = new DoubleWordRegisterCollection(this, registerMap);
         }
@@ -82,13 +121,18 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         public uint ReadDoubleWord(long offset)
         {
+            var denied = DeniedBits(offset, false);
+            if(denied == AllBits)
+            {
+                return 0;
+            }
             if(registers.TryRead(offset, out var result))
             {
-                return result;
+                return result & ~denied;
             }
             if(TryGetChannelBasedOnOffset(offset, out var channel))
             {
-                return channel.ReadDoubleWord(offset);
+                return channel.ReadDoubleWord(offset) & ~denied;
             }
             this.LogUnhandledRead(offset);
             return 0;
@@ -96,6 +140,18 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         public void WriteDoubleWord(long offset, uint value)
         {
+            var denied = DeniedBits(offset, true);
+            if(denied == AllBits)
+            {
+                return;
+            }
+            if(denied != 0)
+            {
+                // The protected bits keep their value
+                var current = registers.TryRead(offset, out var stored) ? stored
+                    : TryGetChannelBasedOnOffset(offset, out var target) ? target.ReadDoubleWord(offset) : 0;
+                value = (value & ~denied) | (current & denied);
+            }
             if(registers.TryWrite(offset, value))
             {
                 return;
@@ -155,8 +211,208 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         public long Size => 0x1000;
 
+        public IReadOnlyDictionary<string, int> StateBits => TransactionStateBits;
+
+        // The transaction state of the GPDMA uses the CortexM.ContextState layout, so that the
+        // TrustZone models check DMA transfers as CPU accesses.
+        public bool TryConvertStateObjToUlong(IContextState stateObj, out ulong? state)
+        {
+            if(stateObj is CortexM.ContextState cortexState)
+            {
+                state = cortexState;
+                return true;
+            }
+            state = null;
+            return false;
+        }
+
+        public bool TryConvertUlongToStateObj(ulong? state, out IContextState stateObj)
+        {
+            if(!state.HasValue)
+            {
+                stateObj = null;
+                return false;
+            }
+            var secure = (state.Value & SecureState) != 0;
+            stateObj = new CortexM.ContextState
+            {
+                Privileged = (state.Value & PrivilegedState) != 0,
+                CpuSecure = secure,
+                AttributionSecure = secure,
+            };
+            return true;
+        }
+
+        // RM0456 section 3.5: the GPDMA1EN, GPDMA1SMEN and GPDMA1RST bits of the RCC are secure
+        // while a channel is secure.
+        public bool HasSecureFunction => trustZoneEnabled && SecureChannels != 0;
+
+        private uint SecureChannels => trustZoneEnabled ? ChannelMask(secureChannels) : 0;
+
+        private uint PrivilegedChannels => ChannelMask(privilegedChannels);
+
+        private static uint ChannelMask(IFlagRegisterField[] flags)
+        {
+            var mask = 0u;
+            for(var i = 0; i < flags.Length; i++)
+            {
+                mask |= flags[i].Value ? 1u << i : 0;
+            }
+            return mask;
+        }
+
+        private uint EnabledChannels => (uint)channels.Select((channel, i) => channel.Enabled ? 1 << i : 0).Sum();
+
+        // RM0456 sections 17.4.14, 17.4.15 and 17.8.1-17.8.5: the bits of the register at offset
+        // denied to the current access.
+        private uint DeniedBits(long offset, bool write)
+        {
+            STM32U5_TrustZoneContext.TryGetTransaction(sysbus, out var secure, out var privileged);
+            secure &= trustZoneEnabled;
+            var secureMask = SecureChannels;
+            var privilegedMask = PrivilegedChannels;
+            var fixedMask = ChannelMask(lockedChannels) | EnabledChannels;
+            switch((Registers)offset)
+            {
+            case Registers.SecureConfiguration:
+                if(!trustZoneEnabled)
+                {
+                    return AllBits;
+                }
+                if(!write)
+                {
+                    return 0;
+                }
+                if(!secure)
+                {
+                    ReportIllegalAccess(offset, write);
+                    return AllBits;
+                }
+                // Written by secure privileged accesses; locked and enabled channels keep their bit
+                return privileged ? fixedMask : AllBits;
+            case Registers.PrivilegedConfiguration:
+                if(!write)
+                {
+                    return 0;
+                }
+                // PRIVx of a secure channel is written by secure accesses only
+                return privileged ? fixedMask | (secure ? 0 : secureMask) : AllBits;
+            case Registers.ConfigurationLock:
+                if(!write)
+                {
+                    return 0;
+                }
+                if(trustZoneEnabled && !secure)
+                {
+                    ReportIllegalAccess(offset, write);
+                    return AllBits;
+                }
+                return privileged ? 0 : AllBits;
+            case Registers.NonsecureMaskedInteruptStatus:
+                return privileged ? 0 : privilegedMask;
+            case Registers.SecureMaskedInteruptStatus:
+                if(!trustZoneEnabled)
+                {
+                    return AllBits;
+                }
+                if(!secure)
+                {
+                    ReportIllegalAccess(offset, write);
+                    return AllBits;
+                }
+                return privileged ? 0 : privilegedMask;
+            }
+            if(!TryGetChannelBasedOnOffset(offset, out var channel))
+            {
+                return 0;
+            }
+            if(channel.Secure && !secure)
+            {
+                ReportIllegalAccess(offset, write);
+                return AllBits;
+            }
+            if(channel.Privileged && !privileged)
+            {
+                return AllBits;
+            }
+            if(offset == (long)Registers.Channel0Transfer1 + channel.Number * ShiftBetweenChannels && (!secure || !channel.Secure))
+            {
+                // SSEC and DSEC: read and written by secure accesses to a secure channel only
+                return TransferSecurityBits;
+            }
+            return 0;
+        }
+
+        private void ReportIllegalAccess(long offset, bool write)
+        {
+            this.Log(LogLevel.Debug, "Non-secure {0} of offset 0x{1:X} denied", write ? "write" : "read", offset);
+            illegalAccessController?.ReportIllegalAccess(illegalAccessRegister, illegalAccessBit);
+        }
+
+        // One data beat with the security of the source and of the destination: the source is
+        // read in one transaction state, the destination written in another.
+        private Response CopyWithAttributes(ulong source, ulong destination, int size, TransferType readType,
+            TransferType writeType, bool incrementRead, bool incrementWrite, bool sourceSecure,
+            bool destinationSecure, bool privileged)
+        {
+            var buffer = new byte[size];
+            using(sysbus.SetLocalContext(this, TransactionState(sourceSecure, privileged)))
+            {
+                for(var index = 0; index < size; index += (int)readType)
+                {
+                    var address = source + (incrementRead ? (ulong)index : 0);
+                    switch(readType)
+                    {
+                    case TransferType.Byte:
+                        buffer[index] = sysbus.ReadByte(address);
+                        break;
+                    case TransferType.Word:
+                        BitConverter.GetBytes(sysbus.ReadWord(address)).CopyTo(buffer, index);
+                        break;
+                    default:
+                        BitConverter.GetBytes(sysbus.ReadDoubleWord(address)).CopyTo(buffer, index);
+                        break;
+                    }
+                }
+            }
+            using(sysbus.SetLocalContext(this, TransactionState(destinationSecure, privileged)))
+            {
+                for(var index = 0; index < size; index += (int)writeType)
+                {
+                    var address = destination + (incrementWrite ? (ulong)index : 0);
+                    switch(writeType)
+                    {
+                    case TransferType.Byte:
+                        sysbus.WriteByte(address, buffer[index]);
+                        break;
+                    case TransferType.Word:
+                        sysbus.WriteWord(address, BitConverter.ToUInt16(buffer, index));
+                        break;
+                    default:
+                        sysbus.WriteDoubleWord(address, BitConverter.ToUInt32(buffer, index));
+                        break;
+                    }
+                }
+            }
+            return new Response
+            {
+                ReadAddress = source + (incrementRead ? (ulong)size : 0),
+                WriteAddress = destination + (incrementWrite ? (ulong)size : 0),
+            };
+        }
+
+        private static ulong TransactionState(bool secure, bool privileged)
+        {
+            return (privileged ? PrivilegedState : 0) | (secure ? SecureState : 0);
+        }
+
         private bool TryGetChannelBasedOnOffset(long offset, out Channel channel)
         {
+            if(offset < (long)Registers.Channel0LinkedListBaseAddress)
+            {
+                channel = null;
+                return false;
+            }
             var shifted = offset - (long)Registers.Channel0LinkedListBaseAddress;
             var channelNumber = shifted / ShiftBetweenChannels;
             channel = channels.ElementAtOrDefault((int)channelNumber);
@@ -173,6 +429,28 @@ namespace Antmicro.Renode.Peripherals.DMA
         private readonly Channel[] channels;
 
         private const int ShiftBetweenChannels = 0x80;
+
+        private readonly bool trustZoneEnabled;
+        private readonly STM32U5_GTZC_TZIC illegalAccessController;
+        private readonly IFlagRegisterField[] secureChannels;
+        private readonly IFlagRegisterField[] privilegedChannels;
+        private readonly IFlagRegisterField[] lockedChannels;
+
+        private const uint AllBits = 0xFFFFFFFF;
+        // GPDMA_CxTR1.SSEC and DSEC.
+        private const uint TransferSecurityBits = (1u << 15) | (1u << 31);
+        // CortexM.ContextState: Privileged, CpuSecure and AttributionSecure.
+        private const ulong PrivilegedState = 1;
+        private const ulong SecureState = 2 | 4;
+        private readonly int illegalAccessRegister;
+        private readonly int illegalAccessBit;
+
+        private static readonly IReadOnlyDictionary<string, int> TransactionStateBits = new Dictionary<string, int>
+        {
+            {"privileged", 0},
+            {"cpuSecure", 1},
+            {"attributionSecure", 2},
+        };
 
         private class Channel
         {
@@ -342,7 +620,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                     .WithTag("Padding alignment mode (PAM)", 11, 2)
                     .WithTag("Source byte exchange (SBX)", 13, 1)
                     .WithFlag(14, name: "Source allocated port (SAP)")
-                    .WithTag("Security attribute source (SSEC)", 15, 1)
+                    .WithFlag(15, out sourceSecure, name: "Security attribute source (SSEC)")
                     .WithEnumField(16, 2, out destinationDataWith, name: "Binary logarithm destination data with (DDW_LOG2)")
                     .WithReservedBits(18, 1)
                     .WithFlag(19, out destinationIncrementingBurst, name: "Destination incrementing burst (DINC)")
@@ -351,7 +629,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                     .WithTag("Destination half-word exchange (DHX)", 27, 1)
                     .WithReservedBits(28, 2)
                     .WithFlag(30, name: "Destination allocated port (DAP)")
-                    .WithTag("Security attribute destination (DSEC)", 31, 1));
+                    .WithFlag(31, out destinationSecure, name: "Security attribute destination (DSEC)"));
 
                 registersMap.Add((long)ChannelRegisters.ChannelTransfer2 + (number * ShiftBetweenChannels), new DoubleWordRegister(parent)
                     .WithValueField(0, 7, out hardwareRequestSelection, name: "Hardware request selection (REQSEL)")
@@ -421,6 +699,22 @@ namespace Antmicro.Renode.Peripherals.DMA
                 active = false;
                 TransferComplete = false;
                 HalfTransfer = false;
+            }
+
+            public bool Secure => parent.SecureChannels != 0 && (parent.SecureChannels & (1u << channelNumber)) != 0;
+
+            public bool Privileged => (parent.PrivilegedChannels & (1u << channelNumber)) != 0;
+
+            public int Number => channelNumber;
+
+            // SSEC and DSEC are cleared when the channel becomes nonsecure (RM0456 17.8.10)
+            public void UpdateSecurityAttributes()
+            {
+                if(!Secure)
+                {
+                    sourceSecure.Value = false;
+                    destinationSecure.Value = false;
+                }
             }
 
             public bool TryServeRequest(int request)
@@ -529,7 +823,12 @@ namespace Antmicro.Renode.Peripherals.DMA
                     {
                         continue;
                     }
-                    var value = parent.sysbus.ReadDoubleWord(address);
+                    // A secure channel loads its items with secure transfers (RM0456 17.4.14)
+                    uint value;
+                    using(parent.trustZoneEnabled ? parent.sysbus.SetLocalContext(parent, TransactionState(Secure, Privileged)) : null)
+                    {
+                        value = parent.sysbus.ReadDoubleWord(address);
+                    }
                     address += 4;
                     registers.Write((long)update.Register + channelNumber * ShiftBetweenChannels, value);
                 }
@@ -593,6 +892,12 @@ namespace Antmicro.Renode.Peripherals.DMA
                     incrementReadAddress,
                     incrementWriteAddress
                 );
+                if(parent.trustZoneEnabled)
+                {
+                    return parent.CopyWithAttributes(sourceAddress, destinationAddress, (int)size, SizeToType(sourceDataWidth),
+                        SizeToType(destinationDataWith), incrementReadAddress, incrementWriteAddress,
+                        Secure && this.sourceSecure.Value, Secure && destinationSecure.Value, Privileged);
+                }
                 return parent.engine.IssueCopy(request);
             }
 
@@ -611,6 +916,8 @@ namespace Antmicro.Renode.Peripherals.DMA
             }
 
             private bool active;
+            private readonly IFlagRegisterField sourceSecure;
+            private readonly IFlagRegisterField destinationSecure;
             private ulong linkedListItemsLoaded;
             private ulong lastLinkedListItemAddress;
             private ulong currentSourceAddress;

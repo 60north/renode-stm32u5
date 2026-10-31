@@ -12,6 +12,10 @@ ${ROOT}             ${CURDIR}/../..
 
 # Documented differences between the model and RM0456 (see the model headers).
 &{DEVIATIONS}       ICACHE_SR=0x00000002    FDCAN1_PSR=0x0000070F
+# The platform has TrustZone disabled (TZEN = 0): the secure FLASH registers are RAZ/WI
+# (RM0456 section 7.5.1).
+&{RAZ_WITHOUT_TRUSTZONE}    FLASH_SECCR=0    FLASH_SECBOOTADD0R=0    FLASH_SECWM1R1=0    FLASH_SECWM1R2=0
+...                         FLASH_SECWM2R1=0    FLASH_SECWM2R2=0
 
 *** Keywords ***
 Create STM32U575 Machine
@@ -22,6 +26,7 @@ Create STM32U575 Machine
 Register Should Match Reset Value
     [Arguments]                     ${name}    ${address}    ${expected}    ${mask}    ${page}    ${source}
     ${expected}=                    Get From Dictionary    ${DEVIATIONS}    ${name}    default=${expected}
+    ${expected}=                    Get From Dictionary    ${RAZ_WITHOUT_TRUSTZONE}    ${name}    default=${expected}
     ${address}=                     Convert To Hex     ${address}    prefix=0x    length=8
     ${value}=                       Execute Command    sysbus ReadDoubleWord ${address}
     ${value}=                       Strip String       ${value}

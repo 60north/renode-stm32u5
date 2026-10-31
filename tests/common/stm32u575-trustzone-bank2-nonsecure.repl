@@ -1,0 +1,7 @@
+// STM32U575 TrustZone platform with the user option bytes of the STM32CubeU5 TrustZone
+// projects: flash bank 1 secure (SECWM1_PSTRT = 0, SECWM1_PEND = 0x7F), bank 2 non-secure
+// (SECWM2_PSTRT = 1, SECWM2_PEND = 0).
+using "../../platforms/cpus/stm32u575-trustzone.repl"
+
+flashController:
+    secureWatermark2: 0xFF80FF81

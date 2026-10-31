@@ -1,0 +1,17 @@
+:name: STM32U575
+:description: Runs a firmware image on the STM32U575 platform. Set $bin before including.
+
+include $ORIGIN/load-models.resc
+
+using sysbus
+$name?="STM32U575"
+mach create $name
+
+machine LoadPlatformDescription $ORIGIN/../platforms/cpus/stm32u575.repl
+
+macro reset
+"""
+    sysbus LoadELF $bin
+"""
+
+runMacro $reset

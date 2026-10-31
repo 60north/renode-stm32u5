@@ -6,6 +6,11 @@
 // LED7 and LED8 are on the I/O expander and are not described.
 using "../cpus/stm32u575.repl"
 
+// 2 MB SRAM (IS61WV102416BLL) on FMC bank 1 NE1, stm32u575i_eval_sram.h SRAM_DEVICE_ADDR and
+// SRAM_DEVICE_SIZE.
+fmcSram: Memory.MappedMemory @ sysbus 0x60000000
+    size: 0x200000
+
 led5: Miscellaneous.LED @ gpioPortB
 
 led6: Miscellaneous.LED @ gpioPortH

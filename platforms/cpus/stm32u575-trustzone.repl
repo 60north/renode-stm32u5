@@ -1,0 +1,471 @@
+// STM32U575 with TrustZone enabled (FLASH_OPTR.TZEN = 1). Extends stm32u575-common.repl.
+//
+// Sources: RM0456 Rev 7 sections 2.2 and 2.3 (Table 3, IDAU), sections 3.5 and 5 (GTZC);
+// cmsis-device-u5 v1.4.3 stm32u575xx.h (*_BASE_S, GTZC_CFGRx bit positions). Requires the
+// models compiled by scripts/load-models.resc.
+//
+// - The Cortex-M33 starts in secure state from SECBOOTADD0, ST production value 0x0C00 0000
+//   (RM0456 section 4, FLASH_SECBOOTADD0R).
+// - IDAU (fixed by hardware, RM0456 Table 3): STM32U5_IDAU, non-secure, or non-secure callable
+//   for the secure aliases. The SAU is configured by the secure software.
+// - Every memory and peripheral is registered at its non-secure address and at its secure
+//   alias, NS + 0x1000 0000 (flash: 0x0C00 0000). Both aliases reach the same model. OTP,
+//   package data, UID and flash size data have no secure alias.
+// - The NVIC system control space has its non-secure alias at 0xE002 E000.
+// - GTZC1 and GTZC2 (STM32U5_GTZC): TZSC, TZIC and MPCBB1-4. The securable peripherals are
+//   registered behind the TZSC firewall (STM32U5_GTZCFirewallRegistration, 1 KB window each)
+//   with their GTZC_CFGRx bit. SRAM1-4 are ArrayMemory behind their MPCBB
+//   (STM32U5_MPCBBRegistration), so that every access is checked; they are slower than the
+//   MappedMemory SRAMs of stm32u575.repl. Both TZIC interrupts drive GTZC_IRQn (8).
+// - BKPSRAM is ArrayMemory behind MPCWM4 (STM32U5_MPCWMRegistration); MPCWM1-3 and 5 have
+//   their registers, the OCTOSPI and FMC memories are described by the boards.
+// - Not modelled yet: the secure registers of the TrustZone-aware peripherals (RCC,
+//   PWR, GPIO, EXTI, FLASH, GPDMA, RTC, TAMP) and their access checks.
+
+using "./stm32u575-common.repl"
+
+cpu:
+    enableTrustZone: true
+    InitVectorTableOffset: 0x0C000000
+
+// Answers the attribution requests of the core; not on the bus.
+idau: CPU.STM32U5_IDAU
+    cpu: cpu
+
+nvic: @ {
+        sysbus new Bus.BusPointRegistration { address: 0xE000E000; cpu: cpu };
+        sysbus new Bus.BusMultiRegistration { address: 0xE002E000; size: 0x1000; region: "NonSecure"; cpu: cpu }
+    }
+
+// GTZC1 at AHB1 + 0x12400 (TZSC), 0x12800 (TZIC), 0x12C00/0x13000/0x13400 (MPCBB1-3); GTZC2 at
+// AHB3 + 0x3000, 0x3400, 0x3800 (MPCBB4) (stm32u575xx.h).
+gtzcIRQ: Miscellaneous.CombinedInput
+    numberOfInputs: 2
+    -> nvic@8
+
+gtzc1Tzic: Miscellaneous.STM32U5_GTZC_TZIC @ {
+        sysbus 0x40032800;
+        sysbus 0x50032800
+    }
+    instance: 1
+    IRQ -> gtzcIRQ@0
+
+gtzc1Tzsc: Miscellaneous.STM32U5_GTZC_TZSC @ {
+        sysbus 0x40032400;
+        sysbus 0x50032400
+    }
+    tzic: gtzc1Tzic
+    instance: 1
+
+gtzc2Tzic: Miscellaneous.STM32U5_GTZC_TZIC @ {
+        sysbus 0x46023400;
+        sysbus 0x56023400
+    }
+    instance: 2
+    IRQ -> gtzcIRQ@1
+
+gtzc2Tzsc: Miscellaneous.STM32U5_GTZC_TZSC @ {
+        sysbus 0x46023000;
+        sysbus 0x56023000
+    }
+    tzic: gtzc2Tzic
+    instance: 2
+
+// SRAM1-4 (stm32u575xx.h *_BASE_NS/_S and *_SIZE) behind MPCBB1-4; the MPCBBz_REG event is
+// the bit after the SRAMz event (GTZC_CFGRx).
+
+gtzc1Mpcbb1: Miscellaneous.STM32U5_GTZC_MPCBB @ {
+        sysbus 0x40032C00;
+        sysbus 0x50032C00
+    }
+    tzic: gtzc1Tzic
+    memorySize: 0x30000
+    eventRegister: 4
+    memoryEventBit: 24
+    registerEventBit: 25
+
+sram1: Memory.ArrayMemory @ {
+        sysbus new Bus.STM32U5_MPCBBRegistration { address: 0x20000000; size: 0x30000; mpcbb: gtzc1Mpcbb1 };
+        sysbus new Bus.STM32U5_MPCBBRegistration { address: 0x30000000; size: 0x30000; mpcbb: gtzc1Mpcbb1 }
+    }
+    size: 0x30000
+
+gtzc1Mpcbb2: Miscellaneous.STM32U5_GTZC_MPCBB @ {
+        sysbus 0x40033000;
+        sysbus 0x50033000
+    }
+    tzic: gtzc1Tzic
+    memorySize: 0x10000
+    eventRegister: 4
+    memoryEventBit: 26
+    registerEventBit: 27
+
+sram2: Memory.ArrayMemory @ {
+        sysbus new Bus.STM32U5_MPCBBRegistration { address: 0x20030000; size: 0x10000; mpcbb: gtzc1Mpcbb2 };
+        sysbus new Bus.STM32U5_MPCBBRegistration { address: 0x30030000; size: 0x10000; mpcbb: gtzc1Mpcbb2 }
+    }
+    size: 0x10000
+
+gtzc1Mpcbb3: Miscellaneous.STM32U5_GTZC_MPCBB @ {
+        sysbus 0x40033400;
+        sysbus 0x50033400
+    }
+    tzic: gtzc1Tzic
+    memorySize: 0x80000
+    eventRegister: 4
+    memoryEventBit: 28
+    registerEventBit: 29
+
+sram3: Memory.ArrayMemory @ {
+        sysbus new Bus.STM32U5_MPCBBRegistration { address: 0x20040000; size: 0x80000; mpcbb: gtzc1Mpcbb3 };
+        sysbus new Bus.STM32U5_MPCBBRegistration { address: 0x30040000; size: 0x80000; mpcbb: gtzc1Mpcbb3 }
+    }
+    size: 0x80000
+
+gtzc2Mpcbb4: Miscellaneous.STM32U5_GTZC_MPCBB @ {
+        sysbus 0x46023800;
+        sysbus 0x56023800
+    }
+    tzic: gtzc2Tzic
+    memorySize: 0x4000
+    eventRegister: 2
+    memoryEventBit: 24
+    registerEventBit: 25
+
+sram4: Memory.ArrayMemory @ {
+        sysbus new Bus.STM32U5_MPCBBRegistration { address: 0x28000000; size: 0x4000; mpcbb: gtzc2Mpcbb4 };
+        sysbus new Bus.STM32U5_MPCBBRegistration { address: 0x38000000; size: 0x4000; mpcbb: gtzc2Mpcbb4 }
+    }
+    size: 0x4000
+
+// Backup SRAM behind MPCWM4 of GTZC1 (RM0456 Table 31), both aliases.
+bkpsram: Memory.ArrayMemory @ {
+        sysbus new Bus.STM32U5_MPCWMRegistration { address: 0x40036400; size: 0x800; tzsc: gtzc1Tzsc; controller: 4 };
+        sysbus new Bus.STM32U5_MPCWMRegistration { address: 0x50036400; size: 0x800; tzsc: gtzc1Tzsc; controller: 4 }
+    }
+    size: 0x800
+
+flash: @ {
+        sysbus 0x08000000;
+        sysbus 0x0C000000
+    }
+
+pwr: @ {
+        sysbus 0x46020800;
+        sysbus 0x56020800
+    }
+    trustZoneEnabled: true
+    illegalAccessController: gtzc2Tzic
+    tzsc1: gtzc1Tzsc
+
+syscfg: @ {
+        sysbus 0x46000400;
+        sysbus 0x56000400
+    }
+    trustZoneEnabled: true
+    illegalAccessController: gtzc2Tzic
+
+rng: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x420C0800; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 13 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x520C0800; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 13 }
+    }
+
+adc1: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x42028000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 8 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x52028000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 8 }
+    }
+
+iwdg: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40003000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 7 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50003000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 7 }
+    }
+
+rtc: @ {
+        sysbus 0x46007800;
+        sysbus 0x56007800
+    }
+    trustZoneEnabled: true
+    illegalAccessController: gtzc2Tzic
+    SecureIRQ -> nvic@3
+
+tamp: @ {
+        sysbus 0x46007C00;
+        sysbus 0x56007C00
+    }
+    trustZoneEnabled: true
+    illegalAccessController: gtzc2Tzic
+
+rcc: @ {
+        sysbus 0x46020C00;
+        sysbus 0x56020C00
+    }
+    trustZoneEnabled: true
+    illegalAccessController: gtzc2Tzic
+    tzsc1: gtzc1Tzsc
+    tzsc2: gtzc2Tzsc
+
+flashController: @ {
+        sysbus 0x40022000;
+        sysbus 0x50022000
+    }
+    trustZoneEnabled: true
+    illegalAccessController: gtzc1Tzic
+    SecureIRQ -> nvic@7
+
+icache: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40030400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 6 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50030400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 6 }
+    }
+
+dcache1: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40031400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 7 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50031400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 7 }
+    }
+
+exti: @ {
+        sysbus 0x46022000;
+        sysbus 0x56022000
+    }
+    trustZoneEnabled: true
+    illegalAccessController: gtzc2Tzic
+
+gpioPortA: @ {
+        sysbus <0x42020000, +0x400>;
+        sysbus <0x52020000, +0x400>
+    }
+    trustZoneEnabled: true
+
+gpioPortB: @ {
+        sysbus <0x42020400, +0x400>;
+        sysbus <0x52020400, +0x400>
+    }
+    trustZoneEnabled: true
+
+gpioPortC: @ {
+        sysbus <0x42020800, +0x400>;
+        sysbus <0x52020800, +0x400>
+    }
+    trustZoneEnabled: true
+
+gpioPortD: @ {
+        sysbus <0x42020C00, +0x400>;
+        sysbus <0x52020C00, +0x400>
+    }
+    trustZoneEnabled: true
+
+gpioPortE: @ {
+        sysbus <0x42021000, +0x400>;
+        sysbus <0x52021000, +0x400>
+    }
+    trustZoneEnabled: true
+
+gpioPortF: @ {
+        sysbus <0x42021400, +0x400>;
+        sysbus <0x52021400, +0x400>
+    }
+    trustZoneEnabled: true
+
+gpioPortG: @ {
+        sysbus <0x42021800, +0x400>;
+        sysbus <0x52021800, +0x400>
+    }
+    trustZoneEnabled: true
+
+gpioPortH: @ {
+        sysbus <0x42021C00, +0x400>;
+        sysbus <0x52021C00, +0x400>
+    }
+    trustZoneEnabled: true
+
+gpioPortI: @ {
+        sysbus <0x42022000, +0x400>;
+        sysbus <0x52022000, +0x400>
+    }
+    trustZoneEnabled: true
+    secureConfigurationResetValue: 0x000000FF
+
+usart1: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40013800; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 2; bit: 3 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50013800; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 2; bit: 3 }
+    }
+
+usart2: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40004400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 9 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50004400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 9 }
+    }
+
+usart3: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40004800; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 10 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50004800; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 10 }
+    }
+
+uart4: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40004C00; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 11 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50004C00; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 11 }
+    }
+
+uart5: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40005000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 12 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50005000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 12 }
+    }
+
+lpuart1: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x46002400; size: 0x400; tzsc: gtzc2Tzsc; configurationRegister: 1; bit: 1 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x56002400; size: 0x400; tzsc: gtzc2Tzsc; configurationRegister: 1; bit: 1 }
+    }
+
+spi1: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40013000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 2; bit: 1 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50013000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 2; bit: 1 }
+    }
+
+spi2: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40003800; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 8 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50003800; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 8 }
+    }
+
+spi3: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x46002000; size: 0x400; tzsc: gtzc2Tzsc; configurationRegister: 1; bit: 0 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x56002000; size: 0x400; tzsc: gtzc2Tzsc; configurationRegister: 1; bit: 0 }
+    }
+
+i2c1: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40005400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 13 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50005400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 13 }
+    }
+
+i2c2: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40005800; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 14 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50005800; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 14 }
+    }
+
+i2c3: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x46002800; size: 0x400; tzsc: gtzc2Tzsc; configurationRegister: 1; bit: 2 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x56002800; size: 0x400; tzsc: gtzc2Tzsc; configurationRegister: 1; bit: 2 }
+    }
+
+i2c4: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40008400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 16 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50008400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 16 }
+    }
+
+fdcanRAM: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x4000AC00; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 18 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x5000AC00; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 18 }
+    }
+
+fdcan1: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x4000A400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 18 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x5000A400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 18 }
+    }
+
+gpdma1: @ {
+        sysbus 0x40020000;
+        sysbus 0x50020000
+    }
+    trustZoneEnabled: true
+    illegalAccessController: gtzc1Tzic
+
+lpdma1: @ {
+        sysbus 0x46025000;
+        sysbus 0x56025000
+    }
+    trustZoneEnabled: true
+    illegalAccessController: gtzc2Tzic
+    illegalAccessRegister: 2
+    illegalAccessBit: 5
+
+sdmmc1: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x420C8000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 17 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x520C8000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 17 }
+    }
+
+sdmmc2: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x420C8C00; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 18 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x520C8C00; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 18 }
+    }
+
+octospi1: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x420D1400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 20 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x520D1400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 20 }
+    }
+
+octospi2: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x420D2400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 21 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x520D2400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 21 }
+    }
+
+octospim: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x420C4000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 16 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x520C4000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 16 }
+    }
+
+fmc: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x420D0400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 19 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x520D0400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 19 }
+    }
+
+lpgpio1: @ {
+        sysbus 0x46020000;
+        sysbus 0x56020000
+    }
+
+hash: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x420C0400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 12 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x520C0400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 3; bit: 12 }
+    }
+
+tim1: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40012C00; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 2; bit: 0 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50012C00; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 2; bit: 0 }
+    }
+
+tim2: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40000000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 0 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50000000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 0 }
+    }
+
+tim3: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40000400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 1 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50000400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 1 }
+    }
+
+tim4: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40000800; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 2 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50000800; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 2 }
+    }
+
+tim5: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40000C00; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 3 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50000C00; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 3 }
+    }
+
+tim6: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40001000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 4 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50001000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 4 }
+    }
+
+tim7: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40001400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 5 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50001400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 1; bit: 5 }
+    }
+
+tim8: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40013400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 2; bit: 2 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50013400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 2; bit: 2 }
+    }
+
+tim15: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40014000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 2; bit: 4 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50014000; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 2; bit: 4 }
+    }
+
+tim16: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40014400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 2; bit: 5 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50014400; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 2; bit: 5 }
+    }
+
+tim17: @ {
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x40014800; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 2; bit: 6 };
+        sysbus new Bus.STM32U5_GTZCFirewallRegistration { address: 0x50014800; size: 0x400; tzsc: gtzc1Tzsc; configurationRegister: 2; bit: 6 }
+    }

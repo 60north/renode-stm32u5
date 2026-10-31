@@ -11,12 +11,20 @@
 // The calendar, alarm, wake-up timer and write protection logic is unchanged. Changes:
 // - U5 register map: SSR, CR, CALR and the alarm registers at their U5 offsets; no backup
 //   registers (they are in TAMP).
-// - Interrupt flags in RTC_SR, cleared through RTC_SCR, masked flags in RTC_MISR.
-// - One interrupt line for alarms and wake-up timer (RTC global interrupt).
-// - New U5 fields are tags (binary mode, privilege and security configuration).
+// - Interrupt flags in RTC_SR, cleared through RTC_SCR, masked flags in RTC_MISR (non-secure
+//   features) and RTC_SMISR (secure features).
+// - Alarms and wake-up timer on two interrupt lines: IRQ (RTC_IRQn) for the non-secure
+//   features, SecureIRQ (RTC_S_IRQn) for the secure features.
+// - TrustZone and privilege protection (sections 63.3.4 and 63.3.5): RTC_SECCFGR and
+//   RTC_PRIVCFGR deny the protected registers and bits to non-secure and unprivileged
+//   accesses (read as 0, writes ignored). A denied non-secure access to a register protected
+//   as a whole, except RTC_WPR, is reported to the TZIC. With trustZoneEnabled = false (TZEN =
+//   0) every access is non-secure and RTC_SECCFGR stays 0.
+// - New U5 fields are tags (binary mode).
 // - The RTC_WPR key protects only the initialization and calibration registers; alarms,
 //   wake-up timer and the other RTC_CR bits are written without it.
 // - The calendar counts from reset, not only after the first exit from initialization mode.
+// - The wake-up timer restarts only when WUTE changes, not on every RTC_CR write.
 // - A system reset leaves the RTC running and configured (backup domain), except the
 //   initialization mode and the write protection.
 //
@@ -27,20 +35,26 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.Timers
 {
-    public class STM32U5_RTC : IDoubleWordPeripheral, IKnownSize
+    public class STM32U5_RTC : IDoubleWordPeripheral, IKnownSize, ISTM32U5_TrustZoneAware
     {
-        public STM32U5_RTC(IMachine machine, ulong wakeupTimerFrequency = DefaultWakeupTimerFrequency)
+        public STM32U5_RTC(IMachine machine, ulong wakeupTimerFrequency = DefaultWakeupTimerFrequency,
+            bool trustZoneEnabled = false, STM32U5_GTZC_TZIC illegalAccessController = null)
         {
+            sysbus = machine.GetSystemBus(this);
+            this.trustZoneEnabled = trustZoneEnabled;
+            this.illegalAccessController = illegalAccessController;
             mainTimer = new TimerConfig(this);
             alarmA = new AlarmConfig(this, mainTimer);
             alarmB = new AlarmConfig(this, mainTimer);
 
             IRQ = new GPIO();
+            SecureIRQ = new GPIO();
 
             // The ticker reaches its limit at (wakeupTimerFrequency / (PREDIV_A + 1) / (PREDIV_S + 1)) Hz
             // The prediv values are usually chosen so that its frequency is 1 Hz but this is not required
@@ -180,6 +194,10 @@ namespace Antmicro.Renode.Peripherals.Timers
                     .WithFlag(10, name: "WUTE",
                         writeCallback: (_, value) =>
                         {
+                            if(value == wakeupTimer.Enabled)
+                            {
+                                return;
+                            }
                             wakeupTimer.Enabled = value;
                             wakeupTimer.Value = 0;
                         },
@@ -446,26 +464,27 @@ namespace Antmicro.Renode.Peripherals.Timers
                     .WithTaggedFlag("SSCLR", 31)
                 },
                 {(long)Registers.PrivilegeModeControlRegister, new DoubleWordRegister(this)
-                    .WithTaggedFlag("ALRAPRIV", 0)
-                    .WithTaggedFlag("ALRBPRIV", 1)
-                    .WithTaggedFlag("WUTPRIV", 2)
-                    .WithTaggedFlag("TSPRIV", 3)
+                    .WithFlag(0, name: "ALRAPRIV")
+                    .WithFlag(1, name: "ALRBPRIV")
+                    .WithFlag(2, name: "WUTPRIV")
+                    .WithFlag(3, name: "TSPRIV")
                     .WithReservedBits(4, 9)
-                    .WithTaggedFlag("CALPRIV", 13)
-                    .WithTaggedFlag("INITPRIV", 14)
-                    .WithTaggedFlag("PRIV", 15)
+                    .WithFlag(13, name: "CALPRIV")
+                    .WithFlag(14, name: "INITPRIV")
+                    .WithFlag(15, name: "PRIV")
                     .WithReservedBits(16, 16)
                 },
                 {(long)Registers.SecureConfigurationRegister, new DoubleWordRegister(this)
-                    .WithTaggedFlag("ALRASEC", 0)
-                    .WithTaggedFlag("ALRBSEC", 1)
-                    .WithTaggedFlag("WUTSEC", 2)
-                    .WithTaggedFlag("TSSEC", 3)
+                    .WithFlag(0, name: "ALRASEC")
+                    .WithFlag(1, name: "ALRBSEC")
+                    .WithFlag(2, name: "WUTSEC")
+                    .WithFlag(3, name: "TSSEC")
                     .WithReservedBits(4, 9)
-                    .WithTaggedFlag("CALSEC", 13)
-                    .WithTaggedFlag("INITSEC", 14)
-                    .WithTaggedFlag("SEC", 15)
+                    .WithFlag(13, name: "CALSEC")
+                    .WithFlag(14, name: "INITSEC")
+                    .WithFlag(15, name: "SEC")
                     .WithReservedBits(16, 16)
+                    .WithWriteCallback((_, __) => UpdateInterrupts())
                 },
                 {(long)Registers.StatusRegister, new DoubleWordRegister(this)
                     .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => alarmA.Flag, name: "ALRAF")
@@ -478,17 +497,13 @@ namespace Antmicro.Renode.Peripherals.Timers
                     .WithReservedBits(7, 25)
                 },
                 {(long)Registers.MaskedInterruptStatusRegister, new DoubleWordRegister(this)
-                    .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => alarmA.Flag && alarmA.InterruptEnable, name: "ALRAMF")
-                    .WithFlag(1, FieldMode.Read, valueProviderCallback: _ => alarmB.Flag && alarmB.InterruptEnable, name: "ALRBMF")
-                    .WithFlag(2, FieldMode.Read, valueProviderCallback: _ => wakeupTimerFlag.Value && wakeupTimer.EventEnabled, name: "WUTMF")
-                    .WithFlag(3, FieldMode.Read, valueProviderCallback: _ => false, name: "TSMF")
-                    .WithFlag(4, FieldMode.Read, valueProviderCallback: _ => false, name: "TSOVMF")
-                    .WithFlag(5, FieldMode.Read, valueProviderCallback: _ => false, name: "ITSMF")
-                    .WithFlag(6, FieldMode.Read, valueProviderCallback: _ => false, name: "SSRUMF")
+                    .WithValueField(0, 7, FieldMode.Read, name: "MISR",
+                        valueProviderCallback: _ => MaskedInterruptFlags() & ~SecureFeatureFlags())
                     .WithReservedBits(7, 25)
                 },
                 {(long)Registers.SecureMaskedInterruptStatusRegister, new DoubleWordRegister(this)
-                    .WithTag("SMISR", 0, 7)
+                    .WithValueField(0, 7, FieldMode.Read, name: "SMISR",
+                        valueProviderCallback: _ => MaskedInterruptFlags() & SecureFeatureFlags())
                     .WithReservedBits(7, 25)
                 },
                 {(long)Registers.StatusClearRegister, new DoubleWordRegister(this)
@@ -537,11 +552,29 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         public uint ReadDoubleWord(long offset)
         {
-            return registers.Read(offset);
+            var denied = DeniedBits(offset, false);
+            return denied == AllBits ? 0 : registers.Read(offset) & ~denied;
         }
 
         public void WriteDoubleWord(long offset, uint value)
         {
+            var denied = DeniedBits(offset, true);
+            if(denied == AllBits)
+            {
+                return;
+            }
+            if(denied != 0)
+            {
+                // RTC_SCR clears the flags of the written ones; the other registers keep the
+                // protected bits. INIT is write-only in the register map: it is kept from the
+                // initialization mode.
+                var kept = offset == (long)Registers.StatusClearRegister ? 0 : registers.Read(offset) & denied;
+                if(offset == (long)Registers.ICSR && initMode)
+                {
+                    kept |= denied & InitializationModeBit;
+                }
+                value = (value & ~denied) | kept;
+            }
             registers.Write(offset, value);
         }
 
@@ -558,9 +591,17 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         public bool WakeupTimerRegisterErrata { get; set; }
 
+        // RM0456 section 63.3.4: the RTC clock and reset bits of the RCC are secure as soon as one
+        // RTC function is secure.
+        public bool HasSecureFunction => trustZoneEnabled && registers.Read((long)Registers.SecureConfigurationRegister) != 0;
+
         public long Size => 0x400;
 
+        // RTC_IRQn: alarms and wake-up timer of the non-secure features.
         public GPIO IRQ { get; }
+
+        // RTC_S_IRQn: alarms and wake-up timer of the secure features (TZEN = 1).
+        public GPIO SecureIRQ { get; }
 
         private void ResetInnerTimers()
         {
@@ -606,14 +647,108 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         private void UpdateInterrupts()
         {
-            var state = false;
+            var state = 0u;
 
-            state |= alarmA.Flag && alarmA.InterruptEnable;
-            state |= alarmB.Flag && alarmB.InterruptEnable;
+            state |= alarmA.Flag && alarmA.InterruptEnable ? AlarmAFlag : 0;
+            state |= alarmB.Flag && alarmB.InterruptEnable ? AlarmBFlag : 0;
 
-            state |= wakeupTimerFlag.Value;
+            state |= wakeupTimerFlag.Value ? WakeupTimerFlag : 0;
 
-            IRQ.Set(state);
+            var secure = SecureFeatureFlags();
+            IRQ.Set((state & ~secure) != 0);
+            SecureIRQ.Set((state & secure) != 0);
+        }
+
+        // RTC_SR bits of the masked interrupts (RTC_MISR | RTC_SMISR).
+        private uint MaskedInterruptFlags()
+        {
+            var flags = 0u;
+            flags |= alarmA.Flag && alarmA.InterruptEnable ? AlarmAFlag : 0;
+            flags |= alarmB.Flag && alarmB.InterruptEnable ? AlarmBFlag : 0;
+            flags |= wakeupTimerFlag.Value && wakeupTimer.EventEnabled ? WakeupTimerFlag : 0;
+            return flags;
+        }
+
+        // RTC_SR bits of the secure features.
+        private uint SecureFeatureFlags()
+        {
+            var configuration = registers.Read((long)Registers.SecureConfigurationRegister);
+            if((configuration & GlobalProtection) != 0)
+            {
+                return InterruptFlags;
+            }
+            return FeatureBits(Registers.StatusRegister, configuration, true);
+        }
+
+        // The bits of the register at offset denied to the current access.
+        private uint DeniedBits(long offset, bool write)
+        {
+            STM32U5_TrustZoneContext.TryGetTransaction(sysbus, out var secure, out var privileged);
+            var denied = 0u;
+            if(!secure || !trustZoneEnabled)
+            {
+                denied |= ProtectedBits(offset, write, Registers.SecureConfigurationRegister,
+                    Registers.PrivilegeModeControlRegister, out var whole);
+                if(trustZoneEnabled && whole && offset != (long)Registers.WriteProtectionRegister)
+                {
+                    // Only the registers protected as a whole are reported, not the mixed ones.
+                    this.Log(LogLevel.Debug, "Non-secure {0} of {1} denied", write ? "write" : "read", (Registers)offset);
+                    illegalAccessController?.ReportIllegalAccess(IllegalAccessRegister, IllegalAccessBit);
+                }
+            }
+            if(!privileged)
+            {
+                denied |= ProtectedBits(offset, write, Registers.PrivilegeModeControlRegister,
+                    Registers.SecureConfigurationRegister, out _);
+            }
+            return denied;
+        }
+
+        // The bits of the register at offset that the configuration register protects:
+        // RTC_SECCFGR against non-secure accesses, RTC_PRIVCFGR against unprivileged accesses.
+        // Both have the same layout. whole: the register is protected as a whole.
+        private uint ProtectedBits(long offset, bool write, Registers configurationRegister,
+            Registers otherConfigurationRegister, out bool whole)
+        {
+            whole = false;
+            if(offset == (long)configurationRegister)
+            {
+                // RTC_SECCFGR is written by secure accesses only, RTC_PRIVCFGR by privileged ones.
+                whole = write;
+                return write ? AllBits : 0;
+            }
+            var configuration = registers.Read((long)configurationRegister);
+            if((configuration & GlobalProtection) != 0)
+            {
+                if(!write && (Array.IndexOf(AlwaysReadable, (Registers)offset) >= 0
+                    || (offset == (long)Registers.MaskedInterruptStatusRegister && configurationRegister == Registers.SecureConfigurationRegister)))
+                {
+                    return 0;
+                }
+                whole = true;
+                return AllBits;
+            }
+            if(offset == (long)otherConfigurationRegister)
+            {
+                // For example INITPRIV is written by secure accesses only when INITSEC is set.
+                return write ? configuration & FeatureProtections : 0;
+            }
+            var bits = FeatureBits((Registers)offset, configuration, write);
+            whole = bits == AllBits;
+            return bits;
+        }
+
+        private static uint FeatureBits(Registers register, uint configuration, bool write)
+        {
+            var bits = 0u;
+            foreach(var rule in FeatureRules)
+            {
+                if(rule.Register == register && (configuration & rule.Feature) != 0 && (write || rule.ReadProtected))
+                {
+                    bits |= rule.Bits;
+                }
+            }
+            return bits;
         }
 
         private bool CheckIfInInitMode(Registers reg)
@@ -765,6 +900,99 @@ namespace Antmicro.Renode.Peripherals.Timers
         private const long DefaultWakeupTimerFrequency = 32768;
         private const int DefaultSynchronuousPrescaler = 0xFF;
         private const int DefaultAsynchronuousPrescaler = 0x7F;
+
+        private readonly IBusController sysbus;
+        private readonly bool trustZoneEnabled;
+        private readonly STM32U5_GTZC_TZIC illegalAccessController;
+
+        private const uint AllBits = 0xFFFFFFFF;
+        // RTC_ICSR.INIT.
+        private const uint InitializationModeBit = 1u << 7;
+        // RTC_SECCFGR and RTC_PRIVCFGR.
+        private const uint AlarmAProtection = 1u << 0;
+        private const uint AlarmBProtection = 1u << 1;
+        private const uint WakeupTimerProtection = 1u << 2;
+        private const uint TimestampProtection = 1u << 3;
+        private const uint CalibrationProtection = 1u << 13;
+        private const uint InitializationProtection = 1u << 14;
+        private const uint GlobalProtection = 1u << 15;
+        private const uint FeatureProtections = 0x600F;
+        // RTC_SR, RTC_MISR, RTC_SMISR and RTC_SCR.
+        private const uint AlarmAFlag = 1u << 0;
+        private const uint AlarmBFlag = 1u << 1;
+        private const uint WakeupTimerFlag = 1u << 2;
+        private const uint InterruptFlags = 0x7F;
+        // GTZC2_TZIC_IER2.RTCIE (RM0456 section 5.8.11).
+        private const int IllegalAccessRegister = 2;
+        private const int IllegalAccessBit = 1;
+
+        // Readable by any access when SEC (or PRIV) is set; RTC_MISR also by non-secure accesses.
+        private static readonly Registers[] AlwaysReadable =
+        {
+            Registers.SecureConfigurationRegister, Registers.PrivilegeModeControlRegister,
+            Registers.TimeRegister, Registers.DateRegister, Registers.SubSecondRegister,
+            Registers.PrescalerRegister, Registers.ClockCalibrationRegister
+        };
+
+        // RM0456 sections 63.3.4 and 63.3.5: the registers and bits of each feature. The
+        // initialization and calibration registers stay readable.
+        private static readonly ProtectionRule[] FeatureRules =
+        {
+            new ProtectionRule(InitializationProtection, Registers.TimeRegister, AllBits, false),
+            new ProtectionRule(InitializationProtection, Registers.DateRegister, AllBits, false),
+            new ProtectionRule(InitializationProtection, Registers.PrescalerRegister, AllBits, false),
+            new ProtectionRule(InitializationProtection, Registers.ICSR, 0x1F80, false), // INIT, BIN, BCDU
+            new ProtectionRule(InitializationProtection, Registers.ControlRegister, 0x40, false), // FMT
+            new ProtectionRule(CalibrationProtection, Registers.ShiftControlRegister, AllBits, false),
+            new ProtectionRule(CalibrationProtection, Registers.ClockCalibrationRegister, AllBits, false),
+            new ProtectionRule(CalibrationProtection, Registers.ControlRegister, 0x30010, false), // ADD1H, SUB1H, REFCKON
+            new ProtectionRule(AlarmAProtection, Registers.AlarmARegister, AllBits, true),
+            new ProtectionRule(AlarmAProtection, Registers.AlarmASubSecondRegister, AllBits, true),
+            new ProtectionRule(AlarmAProtection, Registers.AlarmABinaryModeRegister, AllBits, true),
+            new ProtectionRule(AlarmAProtection, Registers.ControlRegister, 0x08001180, true), // ALRAE, ALRAFCLR, ALRAIE, SSRUIE
+            new ProtectionRule(AlarmAProtection, Registers.StatusRegister, 0x41, true), // ALRAF, SSRUF
+            new ProtectionRule(AlarmAProtection, Registers.MaskedInterruptStatusRegister, 0x41, true),
+            new ProtectionRule(AlarmAProtection, Registers.SecureMaskedInterruptStatusRegister, 0x41, true),
+            new ProtectionRule(AlarmAProtection, Registers.StatusClearRegister, 0x41, true),
+            new ProtectionRule(AlarmBProtection, Registers.AlarmBRegister, AllBits, true),
+            new ProtectionRule(AlarmBProtection, Registers.AlarmBSubSecondRegister, AllBits, true),
+            new ProtectionRule(AlarmBProtection, Registers.AlarmBBinaryModeRegister, AllBits, true),
+            new ProtectionRule(AlarmBProtection, Registers.ControlRegister, 0x10002200, true), // ALRBE, ALRBFCLR, ALRBIE
+            new ProtectionRule(AlarmBProtection, Registers.StatusRegister, 0x2, true),
+            new ProtectionRule(AlarmBProtection, Registers.MaskedInterruptStatusRegister, 0x2, true),
+            new ProtectionRule(AlarmBProtection, Registers.SecureMaskedInterruptStatusRegister, 0x2, true),
+            new ProtectionRule(AlarmBProtection, Registers.StatusClearRegister, 0x2, true),
+            new ProtectionRule(WakeupTimerProtection, Registers.WakeupTimerRegister, AllBits, true),
+            new ProtectionRule(WakeupTimerProtection, Registers.ControlRegister, 0x4407, true), // WUTE, WUTIE, WUCKSEL
+            new ProtectionRule(WakeupTimerProtection, Registers.StatusRegister, 0x4, true),
+            new ProtectionRule(WakeupTimerProtection, Registers.MaskedInterruptStatusRegister, 0x4, true),
+            new ProtectionRule(WakeupTimerProtection, Registers.SecureMaskedInterruptStatusRegister, 0x4, true),
+            new ProtectionRule(WakeupTimerProtection, Registers.StatusClearRegister, 0x4, true),
+            new ProtectionRule(TimestampProtection, Registers.TimestampTimeRegister, AllBits, true),
+            new ProtectionRule(TimestampProtection, Registers.TimestampDateRegister, AllBits, true),
+            new ProtectionRule(TimestampProtection, Registers.TimestampSubSecondRegister, AllBits, true),
+            new ProtectionRule(TimestampProtection, Registers.ControlRegister, 0x03008808, true), // TAMPTS, ITSE, TSE, TSIE, TSEDGE
+            new ProtectionRule(TimestampProtection, Registers.StatusRegister, 0x38, true), // TSF, TSOVF, ITSF
+            new ProtectionRule(TimestampProtection, Registers.MaskedInterruptStatusRegister, 0x38, true),
+            new ProtectionRule(TimestampProtection, Registers.SecureMaskedInterruptStatusRegister, 0x38, true),
+            new ProtectionRule(TimestampProtection, Registers.StatusClearRegister, 0x38, true),
+        };
+
+        private class ProtectionRule
+        {
+            public ProtectionRule(uint feature, Registers register, uint bits, bool readProtected)
+            {
+                Feature = feature;
+                Register = register;
+                Bits = bits;
+                ReadProtected = readProtected;
+            }
+
+            public uint Feature { get; }
+            public Registers Register { get; }
+            public uint Bits { get; }
+            public bool ReadProtected { get; }
+        }
 
         private class TimerConfig
         {

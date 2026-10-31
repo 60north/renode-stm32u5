@@ -1,0 +1,11 @@
+// Test fixture only: an LED on LPGPIO1 output 3 and a button on its input 5. On the chip the
+// I/Os reach pins through GPIO alternate functions; the connection here is arbitrary.
+using "../../platforms/cpus/stm32u575.repl"
+
+lpLed: Miscellaneous.LED @ lpgpio1
+
+lpgpio1:
+    3 -> lpLed@0
+
+lpButton: Miscellaneous.Button @ lpgpio1
+    -> lpgpio1@5

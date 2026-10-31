@@ -10,11 +10,17 @@
 
 include(FetchContent)
 
+# fetch_st_component(<name> <repository> <tag> <commit> [<source directory>])
 function(fetch_st_component name repository tag commit)
+    set(source_dir)
+    if(ARGC GREATER 4)
+        set(source_dir SOURCE_DIR ${ARGV4})
+    endif()
     FetchContent_Declare(${name}
         GIT_REPOSITORY ${repository}
         GIT_TAG ${tag}
         GIT_SHALLOW TRUE
+        ${source_dir}
         # The repositories have no CMake project; only download them.
         SOURCE_SUBDIR do-not-add-subdirectory)
     FetchContent_MakeAvailable(${name})

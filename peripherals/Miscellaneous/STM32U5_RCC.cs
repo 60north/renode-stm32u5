@@ -18,17 +18,27 @@
 //   HSE and LSE are available only when hseFrequency/lseFrequency are non-zero (board option).
 // - Clock security systems, MSI PLL mode, Stop/Standby behaviour and peripheral resets through
 //   the *RSTR registers are not modelled. Enable and sleep-mode enable registers are storage.
+// - TrustZone and privilege (RM0456 section 11.5): with trustZoneEnabled, the bits of RM0456
+//   Table 117 selected by RCC_SECCFGR and the clock, reset and kernel clock bits of the secure
+//   peripherals (STM32U5_RCCSecurity: securable ones from the GTZC TZSC, TrustZone-aware ones from
+//   their model, found by platform name) read as 0 and ignore writes for non-secure accesses,
+//   without an event. A non-secure RCC_SECCFGR write is reported to the TZIC. RCC_PRIVCFGR
+//   SPRIV/NSPRIV apply the same to unprivileged accesses to the secure/non-secure bits.
 // - The SysTick always counts the processor clock (HCLK); RCC_CCIPR1.SYSTICKSEL is storage.
+//   With TrustZone both SysTicks (secure and non-secure) get the clock.
 // - Timer clocks are pushed to the timers given to the constructor: the APB clock if the APB
 //   prescaler is 1, else twice the APB clock (RM0456 section 11.4.15).
 //
 
 using System;
+using System.Collections.Generic;
+using System.Reflection;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.IRQControllers;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
@@ -42,8 +52,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             IHasFrequency tim1 = null, IHasFrequency tim2 = null, IHasFrequency tim3 = null, IHasFrequency tim4 = null,
             IHasFrequency tim5 = null, IHasFrequency tim6 = null, IHasFrequency tim7 = null, IHasFrequency tim8 = null,
             IHasFrequency tim15 = null, IHasFrequency tim16 = null, IHasFrequency tim17 = null,
-            IHasFrequency fdcan1 = null) : base(machine)
+            IHasFrequency fdcan1 = null, bool trustZoneEnabled = false, STM32U5_GTZC_TZIC illegalAccessController = null,
+            STM32U5_GTZC_TZSC tzsc1 = null, STM32U5_GTZC_TZSC tzsc2 = null) : base(machine)
         {
+            sysbus = machine.GetSystemBus(this);
+            this.trustZoneEnabled = trustZoneEnabled;
+            this.illegalAccessController = illegalAccessController;
+            this.tzsc1 = tzsc1;
+            this.tzsc2 = tzsc2;
             this.nvic = nvic;
             this.pwr = pwr;
             this.hseFrequency = hseFrequency;
@@ -88,7 +104,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 this.Log(LogLevel.Warning, "Write to RCC_BDCR ignored: backup domain is write-protected (PWR_DBPR.DBP = 0)");
                 return;
             }
+            var denied = DeniedBits(offset, true);
+            if(denied == AllBits)
+            {
+                return;
+            }
+            if(denied != 0)
+            {
+                // RCC_CICR and RCC_CSR.RMVF act on written ones; the other bits keep their value.
+                var kept = base.ReadDoubleWord(offset) & denied & ~ClearOnWriteBits(offset);
+                value = (value & ~denied) | kept;
+            }
             base.WriteDoubleWord(offset, value);
+        }
+
+        public override uint ReadDoubleWord(long offset)
+        {
+            var denied = DeniedBits(offset, false);
+            return denied == AllBits ? 0 : base.ReadDoubleWord(offset) & ~denied;
         }
 
         public long Size => 0x400;
@@ -106,6 +139,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public ulong Apb3Frequency => PrescaleApb(AhbClock, apb3Prescaler.Value);
 
         public ulong MsisFrequency => MsiRangeFrequency(msiRangeSelect.Value ? msisRange.Value : msisStandbyRange.Value);
+
+        // RCC_SECCFGR.SYSCLKSEC with TZEN = 1; PWR_VOSR VOS and BOOSTEN follow it (RM0456 Table 109).
+        public bool SystemClockSecure => trustZoneEnabled && (base.ReadDoubleWord((long)Registers.SECCFGR) & SystemClockSecureBit) != 0;
 
         public ulong MsikFrequency => MsiRangeFrequency(msiRangeSelect.Value ? msikRange.Value : msikStandbyRange.Value);
 
@@ -872,8 +908,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             // RM p.603, reset 0x00000000
             Registers.PRIVCFGR.Define(this, 0x00000000, name: "RCC_PRIVCFGR")
-                .WithFlag(0, name: "SPRIV")
-                .WithFlag(1, name: "NSPRIV")
+                .WithFlag(0, out securePrivileged, name: "SPRIV")
+                .WithFlag(1, out nonSecurePrivileged, name: "NSPRIV")
                 .WithReservedBits(2, 30)
             ;
         }
@@ -1119,10 +1155,183 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(nvic != null)
             {
                 nvic.Frequency = AhbClock;
+                SetOtherSysTickFrequency(AhbClock);
             }
             UpdateSerialKernelClocks();
             UpdateTimerClocks();
             UpdateFdcanKernelClock();
+        }
+
+        // NVIC.Frequency (Renode 1.17.0) sets the SysTick of the security state of the current CPU
+        // only. With TrustZone both SysTicks count the processor clock, so both banks are set
+        // through the private NVIC SysTick field (no public API).
+        private void SetOtherSysTickFrequency(ulong frequency)
+        {
+            if(!(nvic is NVIC armNvic))
+            {
+                return;
+            }
+            var banks = SysTickBanks?.GetValue(armNvic);
+            if(banks == null)
+            {
+                if(!sysTickBanksWarned)
+                {
+                    this.Log(LogLevel.Warning, "NVIC SysTick banks not found: only the SysTick of the current security state follows the clock");
+                    sysTickBanksWarned = true;
+                }
+                return;
+            }
+            foreach(var bankName in new[] { "SecureVal", "NonSecureVal" })
+            {
+                var bank = banks.GetType().GetField(bankName)?.GetValue(banks);
+                bank?.GetType().GetProperty("Frequency")?.SetValue(bank, frequency);
+            }
+        }
+
+        private readonly IBusController sysbus;
+        private readonly bool trustZoneEnabled;
+        private readonly STM32U5_GTZC_TZIC illegalAccessController;
+        private readonly STM32U5_GTZC_TZSC tzsc1;
+        private readonly STM32U5_GTZC_TZSC tzsc2;
+        private readonly Dictionary<string, ISTM32U5_TrustZoneAware> trustZoneAwarePeripherals = new Dictionary<string, ISTM32U5_TrustZoneAware>();
+        private IFlagRegisterField securePrivileged;
+        private IFlagRegisterField nonSecurePrivileged;
+
+        private const uint AllBits = 0xFFFFFFFF;
+        private const uint SecurePrivilegeBit = 1u << 0;
+        private const uint SystemClockSecureBit = 1u << 5;
+        private const uint RemoveResetFlagsBit = 1u << 23;
+        // GTZC2_TZIC_IER2.RCCIE (stm32u575xx.h GTZC_CFGR2_RCC_Pos).
+        private const int IllegalAccessRegister = 2;
+        private const int IllegalAccessBit = 4;
+
+        private static readonly Dictionary<long, List<STM32U5_RCCSecurity.FeatureRule>> SecurityFeatures =
+            GroupByOffset(STM32U5_RCCSecurity.Features, x => x.Offset);
+        private static readonly Dictionary<long, List<STM32U5_RCCSecurity.PeripheralRule>> SecurityPeripherals =
+            GroupByOffset(STM32U5_RCCSecurity.Peripherals, x => x.Offset);
+
+        private static readonly FieldInfo SysTickBanks = typeof(NVIC).GetField("systick", BindingFlags.NonPublic | BindingFlags.Instance);
+        private bool sysTickBanksWarned;
+
+        // RM0456 section 11.5: the bits of the register at offset denied to the current access.
+        private uint DeniedBits(long offset, bool write)
+        {
+            STM32U5_TrustZoneContext.TryGetTransaction(sysbus, out var secure, out var privileged);
+            secure &= trustZoneEnabled;
+            if(offset == (long)Registers.SECCFGR)
+            {
+                if(!write)
+                {
+                    return 0;
+                }
+                if(trustZoneEnabled && !secure)
+                {
+                    this.Log(LogLevel.Debug, "Non-secure write of RCC_SECCFGR denied");
+                    illegalAccessController?.ReportIllegalAccess(IllegalAccessRegister, IllegalAccessBit);
+                }
+                // Written by secure accesses only, privileged ones with SPRIV; ignored with TZEN = 0.
+                return !secure || (!privileged && securePrivileged.Value) ? AllBits : 0;
+            }
+            if(offset == (long)Registers.PRIVCFGR)
+            {
+                if(!write)
+                {
+                    return 0;
+                }
+                // Written by privileged accesses only; SPRIV by secure ones only.
+                return !privileged ? AllBits : secure ? 0 : SecurePrivilegeBit;
+            }
+            var secureBits = trustZoneEnabled ? SecureBits(offset) : 0;
+            var denied = secure ? 0 : secureBits;
+            if(!privileged)
+            {
+                denied |= securePrivileged.Value ? secureBits : 0;
+                denied |= nonSecurePrivileged.Value ? ~secureBits : 0;
+            }
+            return denied;
+        }
+
+        // The secure bits of the register at offset: RM0456 Table 117 (RCC_SECCFGR) and the bits of
+        // the secure peripherals (STM32U5_RCCSecurity).
+        private uint SecureBits(long offset)
+        {
+            var bits = 0u;
+            if(SecurityFeatures.TryGetValue(offset, out var features))
+            {
+                var configuration = base.ReadDoubleWord((long)Registers.SECCFGR);
+                foreach(var rule in features)
+                {
+                    bits |= (configuration & (1u << rule.Feature)) != 0 ? rule.Bits : 0;
+                }
+            }
+            if(SecurityPeripherals.TryGetValue(offset, out var peripherals))
+            {
+                foreach(var rule in peripherals)
+                {
+                    if((bits & rule.Bits) != rule.Bits && IsSecurePeripheral(rule))
+                    {
+                        bits |= rule.Bits;
+                    }
+                }
+            }
+            return bits;
+        }
+
+        private bool IsSecurePeripheral(STM32U5_RCCSecurity.PeripheralRule rule)
+        {
+            if(rule.Gtzc != 0)
+            {
+                var tzsc = rule.Gtzc == 1 ? tzsc1 : tzsc2;
+                return tzsc != null && tzsc.IsSecure(rule.ConfigurationRegister, rule.Bit);
+            }
+            foreach(var name in rule.TrustZoneAwarePeripherals)
+            {
+                if(TryGetTrustZoneAware(name, out var peripheral) && peripheral.HasSecureFunction)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // TrustZone-aware peripherals are found by their platform name (sysbus.<name>) on first use;
+        // a missing peripheral is looked up again later.
+        private bool TryGetTrustZoneAware(string name, out ISTM32U5_TrustZoneAware peripheral)
+        {
+            if(trustZoneAwarePeripherals.TryGetValue(name, out peripheral))
+            {
+                return peripheral != null;
+            }
+            if(!machine.TryGetByName<IPeripheral>("sysbus." + name, out var found))
+            {
+                return false;
+            }
+            peripheral = found as ISTM32U5_TrustZoneAware;
+            trustZoneAwarePeripherals[name] = peripheral;
+            return peripheral != null;
+        }
+
+        private static uint ClearOnWriteBits(long offset)
+        {
+            if(offset == (long)Registers.CICR)
+            {
+                return AllBits;
+            }
+            return offset == (long)Registers.CSR ? RemoveResetFlagsBit : 0;
+        }
+
+        private static Dictionary<long, List<T>> GroupByOffset<T>(IEnumerable<T> rules, Func<T, long> offset)
+        {
+            var groups = new Dictionary<long, List<T>>();
+            foreach(var rule in rules)
+            {
+                if(!groups.TryGetValue(offset(rule), out var list))
+                {
+                    groups[offset(rule)] = list = new List<T>();
+                }
+                list.Add(rule);
+            }
+            return groups;
         }
 
         private void UpdateTimerClocks()

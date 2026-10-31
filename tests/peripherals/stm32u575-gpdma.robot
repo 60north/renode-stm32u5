@@ -2,12 +2,15 @@
 Documentation       STM32U5 GPDMA register behaviour without firmware (RM0456 Rev 7 section 17):
 ...                 memory-to-memory block transfer with BNDT counted in bytes (17.8.12), transfer
 ...                 complete flag and interrupt, on the first and last channels of both interrupt
-...                 ranges. Linked-list mode and 2D addressing are not modelled.
+...                 ranges; the same on LPDMA1 (the GPDMA model with 4 channels, RM0456 section 18)
+...                 and a peripheral request routed to LPDMA1. Linked-list mode and 2D addressing are
+...                 not tested here.
 Resource            ${CURDIR}/../common/stm32u575.resource
 Test Setup          Create STM32U575 Machine
 
 *** Variables ***
 ${GPDMA1}           0x40020000
+${LPDMA1}           0x46025000
 # Channel x registers at 0x80 * x plus (17.8.7 - 17.8.15):
 ${CxFCR}            0x5C
 ${CxSR}             0x60
@@ -121,6 +124,42 @@ Should Move I2C1 Received Bytes On Its Request
     # I2C1_CR1: PE, RXDMAEN; I2C1_CR2: SADD = 0x42 << 1, RD_WRN, NBYTES = 3, AUTOEND, START.
     Write Word                      0x40005400         (1 << 0) | (1 << 15)
     Write Word                      0x40005404         (0x42 << 1) | (1 << 10) | (3 << 16) | (1 << 25) | (1 << 13)
+    Word Should Be                  ${DESTINATION}     0xAA7C6B5A
+    Field Should Be                 ${br1}             0    16    0
+    Bits Should Be Clear            ${cr}              ${EN}
+
+# LPDMA1: Channel Register uses ${GPDMA1}, set to the LPDMA1 base for these tests.
+# LPDMA1_Channel0_IRQn = 114, LPDMA1_Channel3_IRQn = 117 (stm32u575xx.h).
+Should Copy And Signal Transfer Complete On LPDMA1 Channels 0 And 3
+    Set Test Variable               ${GPDMA1}          ${LPDMA1}
+    Channel Should Copy Exactly BNDT Bytes    0
+    Channel Should Signal Transfer Complete    0    114
+    Channel Should Copy Exactly BNDT Bytes    3
+    Channel Should Signal Transfer Complete    3    117
+
+Should Move I2C3 Received Bytes On Its LPDMA1 Request
+    # LPDMA1 channel 1: REQSEL = i2c3_rx_dma (4, RM0456 Table 148), I2C3_RXDR (offset 0x24) to
+    # memory; I2C3 reads 3 bytes with RXDMAEN set.
+    Set Test Variable               ${GPDMA1}          ${LPDMA1}
+    Execute Command                 machine LoadPlatformDescriptionFromString "target: Mocks.DummyI2CSlave @ i2c3 0x42"
+    Execute Command                 sysbus.i2c3.target EnqueueResponseByte 0x5A
+    Execute Command                 sysbus.i2c3.target EnqueueResponseByte 0x6B
+    Execute Command                 sysbus.i2c3.target EnqueueResponseByte 0x7C
+    Write Word                      ${DESTINATION}     0xAAAAAAAA
+    ${tr1}=                         Channel Register    1    ${CxTR1}
+    ${tr2}=                         Channel Register    1    ${CxTR2}
+    ${br1}=                         Channel Register    1    ${CxBR1}
+    ${sar}=                         Channel Register    1    ${CxSAR}
+    ${dar}=                         Channel Register    1    ${CxDAR}
+    ${cr}=                          Channel Register    1    ${CxCR}
+    Write Word                      ${tr1}             1 << 19
+    Write Word                      ${tr2}             4
+    Write Word                      ${br1}             3
+    Write Word                      ${sar}             0x46002824
+    Write Word                      ${dar}             ${DESTINATION}
+    Write Word                      ${cr}              ${EN}
+    Write Word                      0x46002800         (1 << 0) | (1 << 15)
+    Write Word                      0x46002804         (0x42 << 1) | (1 << 10) | (3 << 16) | (1 << 25) | (1 << 13)
     Word Should Be                  ${DESTINATION}     0xAA7C6B5A
     Field Should Be                 ${br1}             0    16    0
     Bits Should Be Clear            ${cr}              ${EN}

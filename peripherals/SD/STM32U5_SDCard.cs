@@ -13,6 +13,8 @@
 // - SPI mode R3 response (CMD58, CMD1): the OCR is sent most significant byte first, as the SD
 //   Physical Layer Specification requires and as R7 and the register responses already are;
 //   upstream sends it least significant byte first, so CCS of an SDHC card reads 0.
+// - Erase (CMD32, CMD33, CMD38) and command class 5 in the CSD, mandatory for SD memory cards;
+//   erased blocks read 0.
 //
 using System;
 using System.Collections.Generic;
@@ -379,6 +381,7 @@ namespace Antmicro.Renode.Peripherals.SD
                           CardCommandClass.Class0
                         | CardCommandClass.Class2
                         | CardCommandClass.Class4
+                        | CardCommandClass.Class5
                         ), name: "card command classes")
                     .DefineFragment(96, 3, (uint)TransferRate.Transfer10Mbit, name: "transfer rate unit")
                     .DefineFragment(99, 4, (uint)TransferMultiplier.Multiplier2_5, name: "transfer multiplier")
@@ -395,6 +398,7 @@ namespace Antmicro.Renode.Peripherals.SD
                           CardCommandClass.Class0
                         | CardCommandClass.Class2
                         | CardCommandClass.Class4
+                        | CardCommandClass.Class5
                         ), name: "card command classes")
                     .DefineFragment(96, 3, (uint)TransferRate.Transfer10Mbit, name: "transfer rate unit")
                     .DefineFragment(99, 5, (uint)TransferMultiplier.Multiplier2_5, name: "transfer multiplier")
@@ -777,6 +781,36 @@ namespace Antmicro.Renode.Peripherals.SD
                     ? GenerateR1Response()
                     : CardStatus;
 
+            case SdCardCommand.EraseWriteBlockStart_CMD32:
+            case SdCardCommand.EraseWriteBlockEnd_CMD33:
+                if(emmc)
+                {
+                    break;
+                }
+                // Block address for SDHC/SDXC, byte address for standard capacity cards.
+                var eraseAddress = highCapacityMode ? (long)arg * HighCapacityBlockLength : arg;
+                if(command == SdCardCommand.EraseWriteBlockStart_CMD32)
+                {
+                    eraseStart = eraseAddress;
+                }
+                else
+                {
+                    eraseEnd = eraseAddress;
+                }
+                return spiMode
+                    ? GenerateR1Response()
+                    : CardStatus;
+
+            case SdCardCommand.Erase_CMD38:
+                if(emmc)
+                {
+                    break;
+                }
+                EraseBlocks(eraseStart, eraseEnd);
+                return spiMode
+                    ? GenerateR1Response()
+                    : CardStatus;
+
             case SdCardCommand.AppCommand_CMD55:
                 if(emmc)
                 {
@@ -961,6 +995,20 @@ namespace Antmicro.Renode.Peripherals.SD
             backend.Write(data, 0, actualSize);
         }
 
+        // Erases the blocks from the one at start to the one at end, both included.
+        private void EraseBlocks(long start, long end)
+        {
+            var blockSize = highCapacityMode ? HighCapacityBlockLength : blockLengthInBytes;
+            var length = Math.Min(end + blockSize, ActiveBackend.Length) - start;
+            this.Log(LogLevel.Noisy, "Erasing {0} bytes at offset 0x{1:X}", length, start);
+            var zeros = new byte[EraseChunkSize];
+            for(var offset = start; offset < start + length; offset += EraseChunkSize)
+            {
+                var size = (int)Math.Min(EraseChunkSize, start + length - offset);
+                WriteDataToUnderlyingFile(offset, size, zeros);
+            }
+        }
+
         private void WriteData(byte[] data, int length)
         {
             WriteDataToUnderlyingFile(writeContext.Offset, length, data);
@@ -1055,6 +1103,8 @@ namespace Antmicro.Renode.Peripherals.SD
         private SDCardState state;
 
         private uint blockLengthInBytes;
+        private long eraseStart;
+        private long eraseEnd;
         private IoContext writeContext;
         private IoContext readContext;
         private readonly Stream dataBackend;
@@ -1080,6 +1130,7 @@ namespace Antmicro.Renode.Peripherals.SD
         private const byte DummyByte = 0xFF;
         private const byte BlockBeginIndicator = 0xFE;
         private const int HighCapacityBlockLength = 512;
+        private const int EraseChunkSize = 0x10000;
         private const byte DataAcceptedResponse = 0x05;
         private const int EmmcExtendedCsdLength = 512;
         private const int EmmcSizeMultUnit = 128 * 1024; // BOOT_SIZE_MULT / RPMB_SIZE_MULT unit
@@ -1111,6 +1162,9 @@ namespace Antmicro.Renode.Peripherals.SD
             SetBlockCount_CMD23 = 23,
             WriteSingleBlock_CMD24 = 24,
             WriteMultipleBlocks_CMD25 = 25,
+            EraseWriteBlockStart_CMD32 = 32,
+            EraseWriteBlockEnd_CMD33 = 33,
+            Erase_CMD38 = 38,
             IOReadWriteDirect_CM52 = 52,
             AppCommand_CMD55 = 55,
             ReadOperationConditionRegister_CMD58 = 58,

@@ -21,8 +21,14 @@
 // STM32U5-specific:
 // - GPIOx_OTYPER (0x04, RM0456 section 13.4.2) is stored instead of tagged; the output type
 //   (push-pull or open-drain) has no electrical effect in the model.
-// - GPIOx_HSLVR (0x2C, section 13.4.12) and GPIOx_SECCFGR (0x30, section 13.4.13, reset
-//   0x0000 FFFF) are added as storage; I/O voltage and TrustZone filtering are not modelled.
+// - GPIOx_HSLVR (0x2C, section 13.4.12) is added as storage; I/O voltage is not modelled.
+// - TrustZone (sections 13.3.18 and 13.4.13): GPIOx_SECCFGR (0x30) is RAZ/WI unless the
+//   platform sets trustZoneEnabled (TZEN = 1). Then it resets to secureConfigurationResetValue
+//   (0x0000 FFFF; 0x0000 00FF for port I of STM32U575/585), a non-secure write to it is
+//   discarded, and a non-secure access to the bits of a secure pin (Table 128: MODER, OTYPER,
+//   OSPEEDR, PUPDR, IDR, ODR, BSRR, LCKR, AFRL/AFRH, BRR, HSLVR) is RAZ/WI without an illegal
+//   access event. The secure alternate function gate between secure peripherals and
+//   non-secure pins is not modelled.
 // Upstream, these changes belong in STM32_GPIOPort itself.
 //
 
@@ -35,19 +41,24 @@ using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.GPIOPort
 {
     [AllowedTranslations(AllowedTranslation.WordToDoubleWord)]
-    public class STM32U5_GPIOPort : BaseGPIOPort, IDoubleWordPeripheral, ILocalGPIOReceiver
+    public class STM32U5_GPIOPort : BaseGPIOPort, IDoubleWordPeripheral, ILocalGPIOReceiver, ISTM32U5_TrustZoneAware
     {
         // invertedAFPins: List of pin configurations where each inner list contains the pin as the first element,
         // followed by AF numbers that should be inverted for that pin.
         // Example: [[2, 5, 7], [4, 3]] means pin 2 has AFs 5 and 7 inverted, pin 4 has AF 3 inverted.
         public STM32U5_GPIOPort(IMachine machine, uint modeResetValue = 0, uint outputSpeedResetValue = 0, uint pullUpPullDownResetValue = 0,
-            uint numberOfAFs = 16, List<List<int>> invertedAFPins = null) : base(machine, NumberOfPins)
+            uint numberOfAFs = 16, List<List<int>> invertedAFPins = null, bool trustZoneEnabled = false,
+            uint secureConfigurationResetValue = 0x0000FFFF) : base(machine, NumberOfPins)
         {
+            sysbus = machine.GetSystemBus(this);
+            this.trustZoneEnabled = trustZoneEnabled;
+            this.secureConfigurationResetValue = secureConfigurationResetValue;
             if(numberOfAFs < 1 || numberOfAFs > 16)
             {
                 throw new ConstructionException("Number of alternate functions can't be lower than 1 or higher than 16");
@@ -119,13 +130,36 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             }
         }
 
+        // RM0456 section 3.5: the GPIOxEN, GPIOxSMEN and GPIOxRST bits of the RCC are secure while
+        // a pin of the port is secure.
+        public bool HasSecureFunction => SecurePins != 0;
+
+        // The secure pins (GPIOx_SECCFGR with TZEN = 1); PWR_PUCRx/PDCRx follow them.
+        public uint SecurePins => trustZoneEnabled ? registers.Read((long)Registers.SecureConfiguration) & 0xFFFF : 0;
+
         public uint ReadDoubleWord(long offset)
         {
-            return registers.Read(offset);
+            if(offset == (long)Registers.SecureConfiguration && !trustZoneEnabled)
+            {
+                return 0;
+            }
+            return registers.Read(offset) & ~NonSecureHiddenBits(offset);
         }
 
         public void WriteDoubleWord(long offset, uint value)
         {
+            if(offset == (long)Registers.SecureConfiguration && (!trustZoneEnabled || NonSecureAccess()))
+            {
+                return;
+            }
+            var hidden = NonSecureHiddenBits(offset);
+            if(hidden != 0)
+            {
+                // Bit set/reset registers act on written ones; the other registers keep the bits
+                // of the secure pins.
+                var action = offset == (long)Registers.BitSet || offset == (long)Registers.BitReset;
+                value = (value & ~hidden) | (action ? 0u : registers.Read(offset) & hidden);
+            }
             registers.Write(offset, value);
         }
 
@@ -326,7 +360,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                     .WithValueField(0, 16, name: "HSLV")
                     .WithReservedBits(16, 16)
                 },
-                {(long)Registers.SecureConfiguration, new DoubleWordRegister(this, 0x0000FFFF)
+                {(long)Registers.SecureConfiguration, new DoubleWordRegister(this, secureConfigurationResetValue)
                     .WithValueField(0, 16, name: "SEC")
                     .WithReservedBits(16, 16)
                 },
@@ -468,6 +502,54 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             Step2,
             Armed,
         }
+
+        private bool NonSecureAccess()
+        {
+            return STM32U5_TrustZoneContext.TryGetTransaction(sysbus, out var secure, out _) && !secure;
+        }
+
+        // The register bits of the secure pins, for a non-secure access with TZEN = 1.
+        private uint NonSecureHiddenBits(long offset)
+        {
+            if(!trustZoneEnabled || offset == (long)Registers.SecureConfiguration || !NonSecureAccess())
+            {
+                return 0;
+            }
+            var securePins = registers.Read((long)Registers.SecureConfiguration) & 0xFFFF;
+            switch((Registers)offset)
+            {
+            case Registers.Mode:
+            case Registers.OutputSpeed:
+            case Registers.PullUpPullDown:
+                return SpreadPinBits(securePins, 0, 2);
+            case Registers.AlternateFunctionLow:
+                return SpreadPinBits(securePins, 0, 4);
+            case Registers.AlternateFunctionHigh:
+                return SpreadPinBits(securePins, 8, 4);
+            case Registers.BitSet:
+                return securePins | (securePins << 16);
+            default:
+                // OTYPER, IDR, ODR, LCKR (LCKy), BRR and HSLVR: one bit per pin.
+                return securePins;
+            }
+        }
+
+        private static uint SpreadPinBits(uint pins, int firstPin, int width)
+        {
+            var mask = 0u;
+            for(var pin = firstPin; pin < NumberOfPins && pin < firstPin + 32 / width; pin++)
+            {
+                if((pins & (1u << pin)) != 0)
+                {
+                    mask |= ((1u << width) - 1) << ((pin - firstPin) * width);
+                }
+            }
+            return mask;
+        }
+
+        private readonly IBusController sysbus;
+        private readonly bool trustZoneEnabled;
+        private readonly uint secureConfigurationResetValue;
 
         // Source: Chapter 7.4 in RM0090 Cortex M4 Reference Manual (Doc ID 018909 Rev 4)
         // for STM32F40xxx, STM32F41xxx, STM32F42xxx, STM32F43xxx advanced ARM-based 32-bit MCUs

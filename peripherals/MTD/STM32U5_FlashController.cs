@@ -9,7 +9,7 @@
 // Key-based locking (LockRegister), the write filter for the locked control register and the
 // erase sequence are adapted from renode-infrastructure
 //   src/Emulator/Peripherals/Peripherals/MTD/STM32WBA_FlashController.cs @ 7ea0541f8d9b
-// and extended to the two banks of STM32U5 (BKER, MER1, MER2).
+// and extended to the two banks of STM32U5 (BKER, MER1, MER2) and to the secure interface.
 // Register layout and bit positions: cmsis-device-u5 v1.4.3 stm32u575xx.h.
 // Reset values: RM0456 Rev 7 (variant STM32U575); option byte registers hold the documented
 // "ST production value".
@@ -19,11 +19,31 @@
 //   burst alignment, 32-bit accesses, target erased or programmed to zero) and PROGERR, SIZERR,
 //   PGAERR, PGSERR and EOP are set as in RM0456 section 7.3.9. The data is written to the memory
 //   also when an error is reported, and writes while PG is cleared are neither checked nor
-//   blocked. WRPERR (write protection) is not reported.
+//   blocked. WRPERR is reported only for the TrustZone rules below (no WRP areas).
 // - Erase completes immediately (BSY is always 0). Option byte modification, OBL_LAUNCH,
-//   bank swapping, secure and privileged access control, ECC and power-down are not modelled.
+//   bank swapping, HDP areas, the block-based privilege of pages, ECC and power-down are not
+//   modelled.
+// - FLASH_OPTR.TZEN is a constructor parameter: TrustZone is a property of the platform
+//   description (stm32u575-trustzone.repl), it cannot change at run time. The secure
+//   watermarks (FLASH_SECWMxR1, option bytes) are constructor parameters too; page security
+//   follows them, not later writes to FLASH_SECWMxR1. The boot address, watermark and WRP
+//   option registers ignore writes while OPTLOCK is set.
+// - TrustZone (RM0456 sections 7.5, 7.7): two interfaces, FLASH_NSKEYR/NSSR/NSCR and
+//   FLASH_SECKEYR/SECSR/SECCR, with their own lock, flags and interrupt (IRQ: FLASH_IRQn,
+//   SecureIRQ: FLASH_S_IRQn). A page is secure inside the watermark area of its bank or when
+//   its FLASH_SECBBxRy bit is set. An erase or a programming of a page of the other security
+//   through an interface is ignored and sets WRPERR of that interface; a programming and a bank
+//   or mass erase also report a flash illegal access to the TZIC. A programming write is
+//   secure when it goes through the secure alias (0x0C00 0000). Data reads and fetches are not
+//   checked: the flash memory is MappedMemory, and the data of a rejected programming write
+//   reaches the memory; the other words of a rejected quad-word add PGSERR (not checked on
+//   hardware). Secure registers are RAZ/WI for non-secure accesses (a flash register
+//   illegal access is reported to the TZIC; FLASH_SECBBxRy stay readable) and for every access
+//   with TZEN = 0. FLASH_PRIVCFGR SPRIV/NSPRIV make the secure/non-secure registers RAZ/WI for
+//   unprivileged accesses.
 //
 
+using System;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -34,52 +54,112 @@ using Antmicro.Renode.Logging.Profiling;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.Memory;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 
 namespace Antmicro.Renode.Peripherals.MTD
 {
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
-    public class STM32U5_FlashController : STM32_FlashController, IKnownSize
+    public class STM32U5_FlashController : STM32_FlashController, IKnownSize, ISTM32U5_TrustZoneAware
     {
-        public STM32U5_FlashController(IMachine machine, MappedMemory flash) : base(machine)
+        public STM32U5_FlashController(IMachine machine, MappedMemory flash, bool trustZoneEnabled = false,
+            STM32U5_GTZC_TZIC illegalAccessController = null,
+            uint secureWatermark1 = SecureWatermarkProductionValue, uint secureWatermark2 = SecureWatermarkProductionValue)
+            : base(machine)
         {
             memory = flash;
+            sysbus = machine.GetSystemBus(this);
+            this.trustZoneEnabled = trustZoneEnabled;
+            this.illegalAccessController = illegalAccessController;
+            this.secureWatermark1 = secureWatermark1;
+            this.secureWatermark2 = secureWatermark2;
             // Erased flash reads as 0xFF.
             memory.ResetByte = ErasedByte;
-            controlLock = new LockRegister(this, nameof(controlLock), NonSecureKeys);
-            optionLock = new LockRegister(this, nameof(optionLock), OptionKeys);
             IRQ = new GPIO();
+            SecureIRQ = new GPIO();
+            nonSecure = new FlashInterface(false, new LockRegister(this, "controlLock", ControlKeys), IRQ);
+            secure = new FlashInterface(true, new LockRegister(this, "secureControlLock", ControlKeys), SecureIRQ);
+            optionLock = new LockRegister(this, nameof(optionLock), OptionKeys);
             DefineRegisters();
             Reset();
         }
 
         public override void Reset()
         {
-            controlLock.Reset();
+            nonSecure.Lock.Reset();
+            secure.Lock.Reset();
             optionLock.Reset();
             base.Reset();
             IRQ.Unset();
+            SecureIRQ.Unset();
+            nonSecure.ProgramBufferCount = 0;
+            secure.ProgramBufferCount = 0;
             // PG is cleared by the reset without its change callback
             if(programmingHookSet)
             {
-                HandleProgrammingEnableChange(false);
+                UpdateProgrammingHook();
             }
+        }
+
+        public override uint ReadDoubleWord(long offset)
+        {
+            return CheckRegisterAccess(offset, false, out _) ? base.ReadDoubleWord(offset) : 0;
         }
 
         public override void WriteDoubleWord(long offset, uint value)
         {
-            // FLASH_NSCR is write-protected while LOCK is set (RM0456 section 7.9.9); writing 1 to
-            // LOCK itself is always possible.
-            if(offset == (long)Registers.NSCR && controlLock.IsLocked && (value & LockBit) == 0)
+            if(!CheckRegisterAccess(offset, true, out var keptBits))
             {
-                this.Log(LogLevel.Warning, "Write to FLASH_NSCR ignored: register is locked");
                 return;
+            }
+            // FLASH_NSCR and FLASH_SECCR are write-protected while their LOCK is set (RM0456
+            // sections 7.9.9 and 7.9.10); writing 1 to LOCK itself is always possible.
+            var flashInterface = offset == (long)Registers.NSCR ? nonSecure : offset == (long)Registers.SECCR ? secure : null;
+            if(flashInterface != null && flashInterface.Lock.IsLocked && (value & LockBit) == 0)
+            {
+                this.Log(LogLevel.Warning, "Write to {0} ignored: register is locked", (Registers)offset);
+                return;
+            }
+            // RM0456 section 7.9: the boot address, watermark and WRP option registers
+            // cannot be written while OPTLOCK is set.
+            if(Array.IndexOf(OptionLockedRegisters, (Registers)offset) >= 0 && optionLock.IsLocked)
+            {
+                this.Log(LogLevel.Warning, "Write to {0} ignored: OPTLOCK is set", (Registers)offset);
+                return;
+            }
+            if(keptBits != 0)
+            {
+                value = (value & ~keptBits) | (base.ReadDoubleWord(offset) & keptBits);
             }
             base.WriteDoubleWord(offset, value);
         }
 
         public long Size => 0x400;
 
+        // RM0456 section 7.5.5 Table 62: the flash memory is secure when a page is secure (watermark
+        // or block-based), unless FLASH_SECCR.INV inverts it; FLASHEN and FLASHSMEN in the RCC
+        // follow.
+        public bool HasSecureFunction
+        {
+            get
+            {
+                if(!trustZoneEnabled)
+                {
+                    return false;
+                }
+                var securePage = false;
+                for(var bank = 0; bank < 2 && !securePage; bank++)
+                {
+                    securePage = SecurePages(bank) > 0;
+                }
+                return securePage != invertSecurity.Value;
+            }
+        }
+
+        // FLASH_IRQn: the non-secure interface.
         public GPIO IRQ { get; }
+
+        // FLASH_S_IRQn: the secure interface (TZEN = 1).
+        public GPIO SecureIRQ { get; }
 
         private void DefineRegisters()
         {
@@ -96,21 +176,20 @@ namespace Antmicro.Renode.Peripherals.MTD
                 .WithReservedBits(15, 17)
             ;
 
-            // RM0456 section 7.9.2.
+            // RM0456 sections 7.9.2 and 7.9.3: the same keys for both interfaces.
             Registers.NSKEYR.Define(this, 0x00000000, name: "FLASH_NSKEYR")
-                .WithValueField(0, 32, FieldMode.Write, writeCallback: (_, value) => controlLock.ConsumeValue((uint)value), name: "NSKEY")
+                .WithValueField(0, 32, FieldMode.Write, writeCallback: (_, value) => nonSecure.Lock.ConsumeValue((uint)value), name: "NSKEY")
             ;
 
-            // RM p.331, reset 0x00000000
             Registers.SECKEYR.Define(this, 0x00000000, name: "FLASH_SECKEYR")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, FieldMode.Write, writeCallback: (_, value) => secure.Lock.ConsumeValue((uint)value), name: "SECKEY")
             ;
 
             // RM0456 section 7.9.4. Accepted only while FLASH_NSCR is unlocked.
             Registers.OPTKEYR.Define(this, 0x00000000, name: "FLASH_OPTKEYR")
                 .WithValueField(0, 32, FieldMode.Write, writeCallback: (_, value) =>
                     {
-                        if(!controlLock.IsLocked)
+                        if(!nonSecure.Lock.IsLocked)
                         {
                             optionLock.ConsumeValue((uint)value);
                         }
@@ -127,57 +206,26 @@ namespace Antmicro.Renode.Peripherals.MTD
                 .WithReservedBits(0, 32)
             ;
 
-            // RM0456 section 7.9.7. EOP and OPERR are set only with EOPIE/ERRIE; flags clear on 1.
-            Registers.NSSR.Define(this, 0x00000000, name: "FLASH_NSSR")
-                .WithFlag(0, out endOfOperation, FieldMode.Read | FieldMode.WriteOneToClear, name: "EOP")
-                .WithFlag(1, out operationError, FieldMode.Read | FieldMode.WriteOneToClear, name: "OPERR")
-                .WithReservedBits(2, 1)
-                .WithFlag(3, out programmingError, FieldMode.Read | FieldMode.WriteOneToClear, name: "PROGERR")
-                .WithFlag(4, FieldMode.Read | FieldMode.WriteOneToClear, name: "WRPERR")
-                .WithFlag(5, out alignmentError, FieldMode.Read | FieldMode.WriteOneToClear, name: "PGAERR")
-                .WithFlag(6, out sizeError, FieldMode.Read | FieldMode.WriteOneToClear, name: "SIZERR")
-                .WithFlag(7, out programmingSequenceError, FieldMode.Read | FieldMode.WriteOneToClear, name: "PGSERR")
+            // RM0456 sections 7.9.7 and 7.9.8. EOP and OPERR are set only with EOPIE/ERRIE; flags
+            // clear on 1.
+            DefineStatusRegister(Registers.NSSR, nonSecure, "FLASH_NSSR")
                 .WithReservedBits(8, 5)
                 .WithFlag(13, FieldMode.Read | FieldMode.WriteOneToClear, name: "OPTWERR")
                 .WithReservedBits(14, 2)
-                .WithFlag(16, FieldMode.Read, valueProviderCallback: _ => false, name: "BSY")
-                .WithFlag(17, FieldMode.Read, valueProviderCallback: _ => false, name: "WDW")
                 .WithFlag(18, FieldMode.Read, name: "OEM1LOCK")
                 .WithFlag(19, FieldMode.Read, name: "OEM2LOCK")
                 .WithFlag(20, FieldMode.Read, name: "PD1")
                 .WithFlag(21, FieldMode.Read, name: "PD2")
                 .WithReservedBits(22, 10)
-                .WithWriteCallback((_, __) => UpdateInterrupt())
             ;
 
-            // RM p.335, reset 0x00000000
-            Registers.SECSR.Define(this, 0x00000000, name: "FLASH_SECSR")
-                .WithFlag(0, name: "EOP")
-                .WithFlag(1, name: "OPERR")
-                .WithReservedBits(2, 1)
-                .WithFlag(3, name: "PROGERR")
-                .WithFlag(4, name: "WRPERR")
-                .WithFlag(5, name: "PGAERR")
-                .WithFlag(6, name: "SIZERR")
-                .WithFlag(7, name: "PGSERR")
+            DefineStatusRegister(Registers.SECSR, secure, "FLASH_SECSR")
                 .WithReservedBits(8, 8)
-                .WithFlag(16, FieldMode.Read, name: "BSY")
-                .WithFlag(17, FieldMode.Read, name: "WDW")
                 .WithReservedBits(18, 14)
             ;
 
-            // RM0456 section 7.9.9, reset 0xC000 0000 (LOCK and OPTLOCK set).
-            Registers.NSCR.Define(this, 0x00000000, name: "FLASH_NSCR")
-                .WithFlag(0, out programmingEnabled, changeCallback: (_, value) => HandleProgrammingEnableChange(value), name: "PG")
-                .WithFlag(1, out pageErase, name: "PER")
-                .WithFlag(2, out massEraseBank1, name: "MER1")
-                .WithValueField(3, 7, out pageNumber, name: "PNB")
-                .WithReservedBits(10, 1)
-                .WithFlag(11, out bankSelect, name: "BKER")
-                .WithReservedBits(12, 2)
-                .WithFlag(14, out burstProgramming, name: "BWR")
-                .WithFlag(15, out massEraseBank2, name: "MER2")
-                .WithFlag(16, out eraseStart, name: "STRT")
+            // RM0456 sections 7.9.9 and 7.9.10, reset 0xC000 0000 and 0x8000 0000 (LOCK, OPTLOCK).
+            DefineControlRegister(Registers.NSCR, nonSecure, "FLASH_NSCR")
                 .WithFlag(17, FieldMode.Read | FieldMode.Write, valueProviderCallback: _ => false, writeCallback: (_, value) =>
                     {
                         if(value)
@@ -186,8 +234,6 @@ namespace Antmicro.Renode.Peripherals.MTD
                         }
                     }, name: "OPTSTRT")
                 .WithReservedBits(18, 6)
-                .WithFlag(24, out endOfOperationInterruptEnable, name: "EOPIE")
-                .WithFlag(25, out errorInterruptEnable, name: "ERRIE")
                 .WithReservedBits(26, 1)
                 .WithFlag(27, FieldMode.Read | FieldMode.Write, valueProviderCallback: _ => false, writeCallback: (_, value) =>
                     {
@@ -204,43 +250,29 @@ namespace Antmicro.Renode.Peripherals.MTD
                             optionLock.Lock();
                         }
                     }, name: "OPTLOCK")
-                .WithFlag(31, valueProviderCallback: _ => controlLock.IsLocked, writeCallback: (_, value) =>
+                .WithFlag(31, valueProviderCallback: _ => nonSecure.Lock.IsLocked, writeCallback: (_, value) =>
                     {
                         if(value)
                         {
                             optionLock.Lock();
-                            controlLock.Lock();
+                            nonSecure.Lock.Lock();
                         }
                     }, name: "LOCK")
-                .WithWriteCallback((_, __) =>
-                    {
-                        if(eraseStart.Value)
-                        {
-                            StartErase();
-                        }
-                        UpdateInterrupt();
-                    })
             ;
 
-            // RM p.338, reset 0x80000000
-            Registers.SECCR.Define(this, 0x80000000, name: "FLASH_SECCR")
-                .WithFlag(0, name: "PG")
-                .WithFlag(1, name: "PER")
-                .WithFlag(2, name: "MER1")
-                .WithValueField(3, 7, name: "PNB")
-                .WithReservedBits(10, 1)
-                .WithFlag(11, name: "BKER")
-                .WithReservedBits(12, 2)
-                .WithFlag(14, name: "BWR")
-                .WithFlag(15, name: "MER2")
-                .WithFlag(16, name: "STRT")
+            DefineControlRegister(Registers.SECCR, secure, "FLASH_SECCR")
                 .WithReservedBits(17, 7)
-                .WithFlag(24, name: "EOPIE")
-                .WithFlag(25, name: "ERRIE")
                 .WithReservedBits(26, 3)
-                .WithFlag(29, name: "INV")
+                // Inverts the flash security state seen by the RCC (HasSecureFunction).
+                .WithFlag(29, out invertSecurity, name: "INV")
                 .WithReservedBits(30, 1)
-                .WithFlag(31, name: "LOCK")
+                .WithFlag(31, valueProviderCallback: _ => secure.Lock.IsLocked, writeCallback: (_, value) =>
+                    {
+                        if(value)
+                        {
+                            secure.Lock.Lock();
+                        }
+                    }, name: "LOCK")
             ;
 
             // RM p.340, reset 0x00000000
@@ -266,8 +298,9 @@ namespace Antmicro.Renode.Peripherals.MTD
                 .WithValueField(29, 3, FieldMode.Read, name: "CODE_OP")
             ;
 
-            // RM p.342, reset 0xXXXXXXXX, ST production value 0x1FEFF8AA
-            Registers.OPTR.Define(this, 0x1FEFF8AA, name: "FLASH_OPTR")
+            // RM p.342, reset 0xXXXXXXXX, ST production value 0x1FEFF8AA; TZEN as the platform sets it
+            Registers.OPTR.Define(this, OptionRegisterProductionValue | (trustZoneEnabled ? TrustZoneEnableBit : 0u),
+                    name: "FLASH_OPTR")
                 .WithValueField(0, 8, name: "RDP")
                 .WithValueField(8, 3, name: "BOR_LEV")
                 .WithReservedBits(11, 1)
@@ -313,7 +346,7 @@ namespace Antmicro.Renode.Peripherals.MTD
             ;
 
             // RM p.347, reset 0xXXXXXXXX, ST production value 0xFFFFFF80
-            Registers.SECWM1R1.Define(this, 0xFFFFFF80, name: "FLASH_SECWM1R1")
+            Registers.SECWM1R1.Define(this, secureWatermark1, name: "FLASH_SECWM1R1")
                 .WithValueField(0, 7, name: "SECWM1_PSTRT")
                 .WithReservedBits(7, 9)
                 .WithValueField(16, 7, name: "SECWM1_PEND")
@@ -347,7 +380,7 @@ namespace Antmicro.Renode.Peripherals.MTD
             ;
 
             // RM p.351, reset 0xXXXXXXXX, ST production value 0xFFFFFF80
-            Registers.SECWM2R1.Define(this, 0xFFFFFF80, name: "FLASH_SECWM2R1")
+            Registers.SECWM2R1.Define(this, secureWatermark2, name: "FLASH_SECWM2R1")
                 .WithValueField(0, 7, name: "SECWM2_PSTRT")
                 .WithReservedBits(7, 9)
                 .WithValueField(16, 7, name: "SECWM2_PEND")
@@ -402,42 +435,42 @@ namespace Antmicro.Renode.Peripherals.MTD
 
             // RM p.357, reset 0x00000000
             Registers.SECBB1R1.Define(this, 0x00000000, name: "FLASH_SECBB1R1")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "SECBB1i")
             ;
 
             // RM p.357, reset 0x00000000
             Registers.SECBB1R2.Define(this, 0x00000000, name: "FLASH_SECBB1R2")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "SECBB1i")
             ;
 
             // RM p.357, reset 0x00000000
             Registers.SECBB1R3.Define(this, 0x00000000, name: "FLASH_SECBB1R3")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "SECBB1i")
             ;
 
             // RM p.357, reset 0x00000000
             Registers.SECBB1R4.Define(this, 0x00000000, name: "FLASH_SECBB1R4")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "SECBB1i")
             ;
 
             // RM p.357, reset 0x00000000
             Registers.SECBB2R1.Define(this, 0x00000000, name: "FLASH_SECBB2R1")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "SECBB2i")
             ;
 
             // RM p.357, reset 0x00000000
             Registers.SECBB2R2.Define(this, 0x00000000, name: "FLASH_SECBB2R2")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "SECBB2i")
             ;
 
             // RM p.357, reset 0x00000000
             Registers.SECBB2R3.Define(this, 0x00000000, name: "FLASH_SECBB2R3")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "SECBB2i")
             ;
 
             // RM p.357, reset 0x00000000
             Registers.SECBB2R4.Define(this, 0x00000000, name: "FLASH_SECBB2R4")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "SECBB2i")
             ;
 
             // RM p.358, reset 0x00000000
@@ -449,100 +482,270 @@ namespace Antmicro.Renode.Peripherals.MTD
 
             // RM p.358, reset 0x00000000
             Registers.PRIVCFGR.Define(this, 0x00000000, name: "FLASH_PRIVCFGR")
-                .WithFlag(0, name: "SPRIV")
-                .WithFlag(1, name: "NSPRIV")
+                .WithFlag(0, out securePrivileged, name: "SPRIV")
+                .WithFlag(1, out nonSecurePrivileged, name: "NSPRIV")
                 .WithReservedBits(2, 30)
             ;
 
             // RM p.359, reset 0x00000000
             Registers.PRIVBB1R1.Define(this, 0x00000000, name: "FLASH_PRIVBB1R1")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "PRIVBB1i")
             ;
 
             // RM p.359, reset 0x00000000
             Registers.PRIVBB1R2.Define(this, 0x00000000, name: "FLASH_PRIVBB1R2")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "PRIVBB1i")
             ;
 
             // RM p.359, reset 0x00000000
             Registers.PRIVBB1R3.Define(this, 0x00000000, name: "FLASH_PRIVBB1R3")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "PRIVBB1i")
             ;
 
             // RM p.359, reset 0x00000000
             Registers.PRIVBB1R4.Define(this, 0x00000000, name: "FLASH_PRIVBB1R4")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "PRIVBB1i")
             ;
 
             // RM p.360, reset 0x00000000
             Registers.PRIVBB2R1.Define(this, 0x00000000, name: "FLASH_PRIVBB2R1")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "PRIVBB2i")
             ;
 
             // RM p.360, reset 0x00000000
             Registers.PRIVBB2R2.Define(this, 0x00000000, name: "FLASH_PRIVBB2R2")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "PRIVBB2i")
             ;
 
             // RM p.360, reset 0x00000000
             Registers.PRIVBB2R3.Define(this, 0x00000000, name: "FLASH_PRIVBB2R3")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "PRIVBB2i")
             ;
 
             // RM p.360, reset 0x00000000
             Registers.PRIVBB2R4.Define(this, 0x00000000, name: "FLASH_PRIVBB2R4")
-                .WithReservedBits(0, 32)
+                .WithValueField(0, 32, name: "PRIVBB2i")
             ;
         }
 
-        private void StartErase()
+        // The bits common to FLASH_NSSR and FLASH_SECSR.
+        private DoubleWordRegister DefineStatusRegister(Registers register, FlashInterface flash, string name)
         {
-            eraseStart.Value = false;
-            if(!pageErase.Value && !massEraseBank1.Value && !massEraseBank2.Value)
+            return register.Define(this, 0x00000000, name: name)
+                .WithFlag(0, out flash.EndOfOperation, FieldMode.Read | FieldMode.WriteOneToClear, name: "EOP")
+                .WithFlag(1, out flash.OperationError, FieldMode.Read | FieldMode.WriteOneToClear, name: "OPERR")
+                .WithReservedBits(2, 1)
+                .WithFlag(3, out flash.ProgrammingError, FieldMode.Read | FieldMode.WriteOneToClear, name: "PROGERR")
+                .WithFlag(4, out flash.WriteProtectionError, FieldMode.Read | FieldMode.WriteOneToClear, name: "WRPERR")
+                .WithFlag(5, out flash.AlignmentError, FieldMode.Read | FieldMode.WriteOneToClear, name: "PGAERR")
+                .WithFlag(6, out flash.SizeError, FieldMode.Read | FieldMode.WriteOneToClear, name: "SIZERR")
+                .WithFlag(7, out flash.ProgrammingSequenceError, FieldMode.Read | FieldMode.WriteOneToClear, name: "PGSERR")
+                .WithFlag(16, FieldMode.Read, valueProviderCallback: _ => false, name: "BSY")
+                .WithFlag(17, FieldMode.Read, valueProviderCallback: _ => false, name: "WDW")
+                .WithWriteCallback((_, __) => UpdateInterrupt(flash));
+        }
+
+        // The bits common to FLASH_NSCR and FLASH_SECCR.
+        private DoubleWordRegister DefineControlRegister(Registers register, FlashInterface flash, string name)
+        {
+            return register.Define(this, 0x00000000, name: name)
+                .WithFlag(0, out flash.Programming, changeCallback: (_, __) => UpdateProgrammingHook(), name: "PG")
+                .WithFlag(1, out flash.PageErase, name: "PER")
+                .WithFlag(2, out flash.MassEraseBank1, name: "MER1")
+                .WithValueField(3, 7, out flash.PageNumber, name: "PNB")
+                .WithReservedBits(10, 1)
+                .WithFlag(11, out flash.BankSelect, name: "BKER")
+                .WithReservedBits(12, 2)
+                .WithFlag(14, out flash.BurstProgramming, name: "BWR")
+                .WithFlag(15, out flash.MassEraseBank2, name: "MER2")
+                .WithFlag(16, out flash.EraseStart, name: "STRT")
+                .WithFlag(24, out flash.EndOfOperationInterruptEnable, name: "EOPIE")
+                .WithFlag(25, out flash.ErrorInterruptEnable, name: "ERRIE")
+                .WithWriteCallback((_, __) =>
+                    {
+                        if(flash.EraseStart.Value)
+                        {
+                            StartErase(flash);
+                        }
+                        UpdateInterrupt(flash);
+                    });
+        }
+
+        // RM0456 section 7.7, Table 72, Tables 75-77. keptBits: bits that the write must not change.
+        private bool CheckRegisterAccess(long offset, bool write, out uint keptBits)
+        {
+            keptBits = 0;
+            var register = (Registers)offset;
+            var secureRegister = Array.IndexOf(SecureRegisters, register) >= 0;
+            var secureBlockRegister = IsBlockRegister(register, Registers.SECBB1R1, Registers.SECBB2R1);
+            var privilegeBlockRegister = IsBlockRegister(register, Registers.PRIVBB1R1, Registers.PRIVBB2R1);
+            if(!trustZoneEnabled && (secureRegister || secureBlockRegister))
+            {
+                return false;
+            }
+            STM32U5_TrustZoneContext.TryGetTransaction(sysbus, out var secureAccess, out var privileged);
+            secureAccess &= trustZoneEnabled;
+            if(trustZoneEnabled && !secureAccess && (secureRegister || (secureBlockRegister && write)))
+            {
+                this.Log(LogLevel.Debug, "Non-secure {0} of {1} denied", write ? "write" : "read", register);
+                illegalAccessController?.ReportIllegalAccess(IllegalAccessRegister, RegisterIllegalAccessBit);
+                return false;
+            }
+            if(secureBlockRegister || privilegeBlockRegister)
+            {
+                if(!write)
+                {
+                    return true;
+                }
+                if(!privileged && privilegeBlockRegister)
+                {
+                    return false;
+                }
+                // Unprivileged secure writes keep the bits of privileged pages; non-secure
+                // writes keep the privilege bits of secure pages.
+                var bank = register >= (privilegeBlockRegister ? Registers.PRIVBB2R1 : Registers.SECBB2R1) ? 1 : 0;
+                var firstPage = (int)(offset - (long)(privilegeBlockRegister
+                    ? (bank == 0 ? Registers.PRIVBB1R1 : Registers.PRIVBB2R1)
+                    : (bank == 0 ? Registers.SECBB1R1 : Registers.SECBB2R1))) / 4 * 32;
+                for(var bit = 0; bit < 32; bit++)
+                {
+                    var kept = privilegeBlockRegister ? !secureAccess && IsSecurePage(bank, firstPage + bit) : !privileged && IsPrivilegedPage(bank, firstPage + bit);
+                    keptBits |= kept ? 1u << bit : 0;
+                }
+                return true;
+            }
+            if(register == Registers.PRIVCFGR)
+            {
+                if(write && !privileged)
+                {
+                    return false;
+                }
+                // SPRIV is written by secure accesses only.
+                keptBits = write && !secureAccess ? 1u : 0;
+                return true;
+            }
+            if(!privileged && (secureRegister ? securePrivileged.Value : nonSecurePrivileged.Value))
+            {
+                return false;
+            }
+            return true;
+        }
+
+        private static bool IsBlockRegister(Registers register, Registers bank1First, Registers bank2First)
+        {
+            return (register >= bank1First && register < bank1First + BlockRegisters * 4)
+                || (register >= bank2First && register < bank2First + BlockRegisters * 4);
+        }
+
+        // RM0456 sections 7.5.2 and 7.5.4: the watermark area of the bank or the block-based bit.
+        // The watermarks are the option bytes loaded at reset (the constructor values): a write
+        // to FLASH_SECWMxR1 takes effect only after an option byte loading, not modelled.
+        private bool IsSecurePage(int bank, int page)
+        {
+            if(!trustZoneEnabled)
+            {
+                return false;
+            }
+            var watermark = bank == 0 ? secureWatermark1 : secureWatermark2;
+            var start = watermark & 0x7F;
+            var end = (watermark >> 16) & 0x7F;
+            if(start <= page && page <= end)
+            {
+                return true;
+            }
+            return IsBlockBitSet(bank == 0 ? Registers.SECBB1R1 : Registers.SECBB2R1, page);
+        }
+
+        private bool IsPrivilegedPage(int bank, int page)
+        {
+            return IsBlockBitSet(bank == 0 ? Registers.PRIVBB1R1 : Registers.PRIVBB2R1, page);
+        }
+
+        private bool IsBlockBitSet(Registers firstRegister, int page)
+        {
+            var bits = base.ReadDoubleWord((long)firstRegister + page / 32 * 4);
+            return (bits & (1u << (page % 32))) != 0;
+        }
+
+        // The number of secure pages of the bank.
+        private int SecurePages(int bank)
+        {
+            var count = 0;
+            for(var page = 0; page < PagesPerBank; page++)
+            {
+                count += IsSecurePage(bank, page) ? 1 : 0;
+            }
+            return count;
+        }
+
+        private void StartErase(FlashInterface flash)
+        {
+            flash.EraseStart.Value = false;
+            if(!flash.PageErase.Value && !flash.MassEraseBank1.Value && !flash.MassEraseBank2.Value)
             {
                 this.Log(LogLevel.Warning, "Erase started with none of PER, MER1 and MER2 set");
-                programmingSequenceError.Value = true;
-                if(errorInterruptEnable.Value)
-                {
-                    operationError.Value = true;
-                }
-                UpdateInterrupt();
+                ReportOperationError(flash, flash.ProgrammingSequenceError);
                 return;
             }
 
             var bankSize = memory.Size / 2;
-            if(massEraseBank1.Value)
+            if(flash.MassEraseBank1.Value || flash.MassEraseBank2.Value)
             {
-                this.DebugLog("Erasing bank 1");
-                memory.ZeroRange(0, bankSize);
-                ForgetProgrammedQuadWords(0, bankSize);
+                // RM0456 Table 70: a bank of the other security, or with pages of both, is not
+                // erased.
+                for(var bank = 0; bank < 2; bank++)
+                {
+                    var selected = bank == 0 ? flash.MassEraseBank1.Value : flash.MassEraseBank2.Value;
+                    var securePages = SecurePages(bank);
+                    if(selected && securePages != (flash.Secure ? PagesPerBank : 0))
+                    {
+                        this.Log(LogLevel.Warning, "{0} erase of bank {1} with {2} secure pages denied", flash.Name, bank + 1, securePages);
+                        illegalAccessController?.ReportIllegalAccess(IllegalAccessRegister, MemoryIllegalAccessBit);
+                        ReportOperationError(flash, flash.WriteProtectionError);
+                        return;
+                    }
+                }
+                if(flash.MassEraseBank1.Value)
+                {
+                    this.DebugLog("Erasing bank 1");
+                    memory.ZeroRange(0, bankSize);
+                    ForgetProgrammedQuadWords(0, bankSize);
+                }
+                if(flash.MassEraseBank2.Value)
+                {
+                    this.DebugLog("Erasing bank 2");
+                    memory.ZeroRange(bankSize, bankSize);
+                    ForgetProgrammedQuadWords(bankSize, bankSize);
+                }
             }
-            if(massEraseBank2.Value)
+            else
             {
-                this.DebugLog("Erasing bank 2");
-                memory.ZeroRange(bankSize, bankSize);
-                ForgetProgrammedQuadWords(bankSize, bankSize);
-            }
-            if(pageErase.Value && !massEraseBank1.Value && !massEraseBank2.Value)
-            {
-                var offset = (bankSelect.Value ? bankSize : 0) + (long)pageNumber.Value * PageSize;
+                var bank = flash.BankSelect.Value ? 1 : 0;
+                var page = (int)flash.PageNumber.Value;
+                var offset = bank * bankSize + (long)page * PageSize;
                 if(offset + PageSize > memory.Size)
                 {
-                    this.Log(LogLevel.Warning, "Page {0} of bank {1} is outside the flash memory", pageNumber.Value, bankSelect.Value ? 2 : 1);
-                    programmingSequenceError.Value = true;
-                    UpdateInterrupt();
+                    this.Log(LogLevel.Warning, "Page {0} of bank {1} is outside the flash memory", page, bank + 1);
+                    ReportOperationError(flash, flash.ProgrammingSequenceError);
                     return;
                 }
-                this.DebugLog("Erasing page {0} of bank {1}", pageNumber.Value, bankSelect.Value ? 2 : 1);
+                // RM0456 Table 68: a page of the other security is not erased.
+                if(IsSecurePage(bank, page) != flash.Secure)
+                {
+                    this.Log(LogLevel.Warning, "{0} erase of page {1} of bank {2} denied: the page is {3}", flash.Name, page, bank + 1, flash.Secure ? "non-secure" : "secure");
+                    ReportOperationError(flash, flash.WriteProtectionError);
+                    return;
+                }
+                this.DebugLog("Erasing page {0} of bank {1}", page, bank + 1);
                 memory.ZeroRange(offset, PageSize);
                 ForgetProgrammedQuadWords(offset, PageSize);
             }
 
-            if(endOfOperationInterruptEnable.Value)
+            if(flash.EndOfOperationInterruptEnable.Value)
             {
-                endOfOperation.Value = true;
+                flash.EndOfOperation.Value = true;
             }
-            UpdateInterrupt();
+            UpdateInterrupt(flash);
         }
 
         // Programming (RM0456 section 7.3.7): while PG is set, the writes of the CPU to the flash
@@ -550,15 +753,17 @@ namespace Antmicro.Renode.Peripherals.MTD
         // hook runs after the write, so the data reaches the memory in any case; the hook checks
         // the sequence and sets the error flags of RM0456 section 7.3.9. Writes while PG is
         // cleared are not observed.
-        private void HandleProgrammingEnableChange(bool value)
+        private void UpdateProgrammingHook()
         {
+            var value = nonSecure.Programming.Value || secure.Programming.Value;
             var cpus = machine.GetSystemBus(this).GetCPUs().OfType<ICPUWithMemoryAccessHooks>();
             foreach(var cpu in cpus)
             {
                 cpu.SetHookAtMemoryAccess(value ? (MemoryAccessHook)OnMemoryProgramWrite : null);
             }
             programmingHookSet = value;
-            programBufferCount = 0;
+            nonSecure.ProgramBufferCount = 0;
+            secure.ProgramBufferCount = 0;
         }
 
         private void OnMemoryProgramWrite(ulong _, MemoryOperation operation, ulong __, ulong physicalAddress, uint width, ulong value)
@@ -572,38 +777,55 @@ namespace Antmicro.Renode.Peripherals.MTD
             {
                 return;
             }
-            var offset = (long)(physicalAddress - bus.GetRegistrationPoints(memory).First().Range.StartAddress);
-            HandleProgramWrite(offset, width, (uint)value);
+            var alias = bus.GetRegistrationPoints(memory).First(x => x.Range.Contains(physicalAddress)).Range.StartAddress;
+            // The secure alias carries the secure writes (the core faults non-secure ones).
+            var flash = trustZoneEnabled && alias == SecureAliasAddress ? secure : nonSecure;
+            if(!flash.Programming.Value)
+            {
+                return;
+            }
+            HandleProgramWrite(flash, (long)(physicalAddress - alias), width, (uint)value);
         }
 
-        private void HandleProgramWrite(long offset, uint width, uint value)
+        private void HandleProgramWrite(FlashInterface flash, long offset, uint width, uint value)
         {
             // A write after a programming error is a sequence error
-            if(programmingError.Value || alignmentError.Value || sizeError.Value || programmingSequenceError.Value)
+            if(flash.ProgrammingError.Value || flash.AlignmentError.Value || flash.SizeError.Value
+                || flash.ProgrammingSequenceError.Value || flash.WriteProtectionError.Value)
             {
-                ReportProgrammingError(programmingSequenceError, "write after a previous programming error");
+                ReportProgrammingError(flash, flash.ProgrammingSequenceError, "write after a previous programming error");
+                return;
+            }
+            // RM0456 Table 68: a page of the other security is not programmed.
+            var bankSize = memory.Size / 2;
+            var bank = (int)(offset / bankSize);
+            var page = (int)(offset % bankSize / PageSize);
+            if(IsSecurePage(bank, page) != flash.Secure)
+            {
+                illegalAccessController?.ReportIllegalAccess(IllegalAccessRegister, MemoryIllegalAccessBit);
+                ReportProgrammingError(flash, flash.WriteProtectionError, "{0} write to page {1} of bank {2}", flash.Name, page, bank + 1);
                 return;
             }
             // Only 32-bit data can be written
             if(width != 4)
             {
-                ReportProgrammingError(sizeError, "{0}-byte write", width);
+                ReportProgrammingError(flash, flash.SizeError, "{0}-byte write", width);
                 return;
             }
             // Quad-word programming, or 8 quad-words in burst mode
-            var groupSize = burstProgramming.Value ? BurstSize : QuadWordSize;
-            if(programBufferCount == 0)
+            var groupSize = flash.BurstProgramming.Value ? BurstSize : QuadWordSize;
+            if(flash.ProgramBufferCount == 0)
             {
                 if(offset % groupSize != 0)
                 {
-                    ReportProgrammingError(alignmentError, "first word at 0x{0:X} not aligned to {1} bytes", offset, groupSize);
+                    ReportProgrammingError(flash, flash.AlignmentError, "first word at 0x{0:X} not aligned to {1} bytes", offset, groupSize);
                     return;
                 }
-                programBufferStart = offset;
+                flash.ProgramBufferStart = offset;
             }
-            else if(offset != programBufferStart + programBufferCount)
+            else if(offset != flash.ProgramBufferStart + flash.ProgramBufferCount)
             {
-                ReportProgrammingError(alignmentError, "word at 0x{0:X} does not follow the previous one", offset);
+                ReportProgrammingError(flash, flash.AlignmentError, "word at 0x{0:X} does not follow the previous one", offset);
                 return;
             }
 
@@ -611,32 +833,32 @@ namespace Antmicro.Renode.Peripherals.MTD
             if(offset == quadWord)
             {
                 // The other words of the quad-word are not written yet
-                quadWordWasErased = IsErased(quadWord);
-                quadWordWasZero = IsZero(quadWord);
-                quadWordIsZero = true;
+                flash.QuadWordWasErased = IsErased(quadWord);
+                flash.QuadWordWasZero = IsZero(quadWord);
+                flash.QuadWordIsZero = true;
             }
-            quadWordIsZero &= value == 0;
-            programBufferCount += (int)width;
+            flash.QuadWordIsZero &= value == 0;
+            flash.ProgramBufferCount += (int)width;
 
             if(offset + width == quadWord + QuadWordSize)
             {
                 // A quad-word that is not erased can only be programmed to all zeros, once
-                if(!quadWordWasErased && (!quadWordIsZero || quadWordWasZero))
+                if(!flash.QuadWordWasErased && (!flash.QuadWordIsZero || flash.QuadWordWasZero))
                 {
-                    ReportProgrammingError(programmingError, "quad-word at 0x{0:X} is not erased", quadWord);
+                    ReportProgrammingError(flash, flash.ProgrammingError, "quad-word at 0x{0:X} is not erased", quadWord);
                     return;
                 }
-                programmedQuadWords[quadWord] = quadWordIsZero;
+                programmedQuadWords[quadWord] = flash.QuadWordIsZero;
                 this.DebugLog("Programmed quad-word at offset 0x{0:X} of the flash memory", quadWord);
             }
-            if(programBufferCount == groupSize)
+            if(flash.ProgramBufferCount == groupSize)
             {
-                programBufferCount = 0;
-                if(endOfOperationInterruptEnable.Value)
+                flash.ProgramBufferCount = 0;
+                if(flash.EndOfOperationInterruptEnable.Value)
                 {
-                    endOfOperation.Value = true;
+                    flash.EndOfOperation.Value = true;
                 }
-                UpdateInterrupt();
+                UpdateInterrupt(flash);
             }
         }
 
@@ -675,16 +897,21 @@ namespace Antmicro.Renode.Peripherals.MTD
             return true;
         }
 
-        private void ReportProgrammingError(IFlagRegisterField flag, string reason, params object[] arguments)
+        private void ReportProgrammingError(FlashInterface flash, IFlagRegisterField flag, string reason, params object[] arguments)
         {
             this.Log(LogLevel.Warning, "Flash programming error: " + reason, arguments);
+            flash.ProgramBufferCount = 0;
+            ReportOperationError(flash, flag);
+        }
+
+        private void ReportOperationError(FlashInterface flash, IFlagRegisterField flag)
+        {
             flag.Value = true;
-            programBufferCount = 0;
-            if(errorInterruptEnable.Value)
+            if(flash.ErrorInterruptEnable.Value)
             {
-                operationError.Value = true;
+                flash.OperationError.Value = true;
             }
-            UpdateInterrupt();
+            UpdateInterrupt(flash);
         }
 
         private void ForgetProgrammedQuadWords(long start, long size)
@@ -695,53 +922,110 @@ namespace Antmicro.Renode.Peripherals.MTD
             }
         }
 
-        private void UpdateInterrupt()
+        private void UpdateInterrupt(FlashInterface flash)
         {
-            var pending = (endOfOperationInterruptEnable.Value && endOfOperation.Value)
-                || (errorInterruptEnable.Value && operationError.Value);
-            IRQ.Set(pending);
+            var pending = (flash.EndOfOperationInterruptEnable.Value && flash.EndOfOperation.Value)
+                || (flash.ErrorInterruptEnable.Value && flash.OperationError.Value);
+            flash.Interrupt.Set(pending);
         }
 
-        private IFlagRegisterField endOfOperation;
-        private IFlagRegisterField operationError;
-        private IFlagRegisterField programmingSequenceError;
-        private IFlagRegisterField programmingError;
-        private IFlagRegisterField alignmentError;
-        private IFlagRegisterField sizeError;
-        private IFlagRegisterField programmingEnabled;
-        private IFlagRegisterField burstProgramming;
-        private int programBufferCount;
         private bool programmingHookSet;
-        private long programBufferStart;
-        private bool quadWordWasErased;
-        private bool quadWordWasZero;
-        private bool quadWordIsZero;
+        private IFlagRegisterField invertSecurity;
+        private IFlagRegisterField securePrivileged;
+        private IFlagRegisterField nonSecurePrivileged;
 
         // Quad-words programmed since the last erase; the value tells whether all bits are zero
         private readonly Dictionary<long, bool> programmedQuadWords = new Dictionary<long, bool>();
-        private IFlagRegisterField pageErase;
-        private IFlagRegisterField massEraseBank1;
-        private IFlagRegisterField massEraseBank2;
-        private IValueRegisterField pageNumber;
-        private IFlagRegisterField bankSelect;
-        private IFlagRegisterField eraseStart;
-        private IFlagRegisterField endOfOperationInterruptEnable;
-        private IFlagRegisterField errorInterruptEnable;
 
         private readonly MappedMemory memory;
-        private readonly LockRegister controlLock;
+        private readonly IBusController sysbus;
+        private readonly bool trustZoneEnabled;
+        private readonly STM32U5_GTZC_TZIC illegalAccessController;
+        private readonly uint secureWatermark1;
+        private readonly uint secureWatermark2;
+        private readonly FlashInterface nonSecure;
+        private readonly FlashInterface secure;
         private readonly LockRegister optionLock;
 
         private const byte ErasedByte = 0xFF;
         private const uint ErasedWord = 0xFFFFFFFF;
         private const int QuadWordSize = 16;
         private const int BurstSize = 8 * QuadWordSize;
-        // 8 Kbytes (stm32u575xx.h FLASH_PAGE_SIZE).
+        // 8 Kbytes (stm32u575xx.h FLASH_PAGE_SIZE), 128 pages per bank (FLASH_PAGE_NB).
         private const long PageSize = 0x2000;
+        private const int PagesPerBank = 128;
+        private const int BlockRegisters = 4;
         private const uint LockBit = 1u << 31;
-        // FLASH_KEY1/2 and FLASH_OPTKEY1/2 (RM0456 sections 7.9.2 and 7.9.4).
-        private static readonly uint[] NonSecureKeys = { 0x45670123, 0xCDEF89AB };
+        private const uint OptionRegisterProductionValue = 0x1FEFF8AA;
+        private const uint TrustZoneEnableBit = 1u << 31;
+        // ST production value of FLASH_SECWMxR1: SECWMx_PSTRT = 0, SECWMx_PEND = 0x7F.
+        private const uint SecureWatermarkProductionValue = 0xFFFFFF80;
+        private const ulong SecureAliasAddress = 0x0C000000;
+        // GTZC1_TZIC_IER4 FLASH_REGIE and FLASHIE (stm32u575xx.h GTZC_CFGR4_FLASH_REG_Pos,
+        // GTZC_CFGR4_FLASH_Pos).
+        private const int IllegalAccessRegister = 4;
+        private const int RegisterIllegalAccessBit = 1;
+        private const int MemoryIllegalAccessBit = 2;
+        // FLASH_KEY1/2 and FLASH_OPTKEY1/2 (RM0456 sections 7.9.2 to 7.9.4).
+        private static readonly uint[] ControlKeys = { 0x45670123, 0xCDEF89AB };
         private static readonly uint[] OptionKeys = { 0x08192A3B, 0x4C5D6E7F };
+
+        // RM0456 section 7.9: "This register can not be written if OPTLOCK bit is set".
+        private static readonly Registers[] OptionLockedRegisters =
+        {
+            Registers.NSBOOTADD0R, Registers.NSBOOTADD1R, Registers.SECBOOTADD0R,
+            Registers.SECWM1R1, Registers.SECWM1R2, Registers.WRP1AR, Registers.WRP1BR,
+            Registers.SECWM2R1, Registers.SECWM2R2, Registers.WRP2AR, Registers.WRP2BR
+        };
+
+        // RM0456 section 7.9: "This register is secure" (FLASH_SECBBxRy separately).
+        private static readonly Registers[] SecureRegisters =
+        {
+            Registers.SECKEYR, Registers.SECSR, Registers.SECCR, Registers.SECBOOTADD0R,
+            Registers.SECWM1R1, Registers.SECWM1R2, Registers.SECWM2R1, Registers.SECWM2R2,
+            Registers.SECHDPCR
+        };
+
+        // One erase and programming interface: FLASH_NSKEYR/NSSR/NSCR or FLASH_SECKEYR/SECSR/SECCR.
+        private class FlashInterface
+        {
+            public FlashInterface(bool secure, LockRegister lockRegister, GPIO interrupt)
+            {
+                Secure = secure;
+                Lock = lockRegister;
+                Interrupt = interrupt;
+            }
+
+            public string Name => Secure ? "Secure" : "Non-secure";
+
+            public readonly bool Secure;
+            public readonly LockRegister Lock;
+            public readonly GPIO Interrupt;
+
+            public IFlagRegisterField EndOfOperation;
+            public IFlagRegisterField OperationError;
+            public IFlagRegisterField ProgrammingError;
+            public IFlagRegisterField WriteProtectionError;
+            public IFlagRegisterField AlignmentError;
+            public IFlagRegisterField SizeError;
+            public IFlagRegisterField ProgrammingSequenceError;
+            public IFlagRegisterField Programming;
+            public IFlagRegisterField PageErase;
+            public IFlagRegisterField MassEraseBank1;
+            public IFlagRegisterField MassEraseBank2;
+            public IValueRegisterField PageNumber;
+            public IFlagRegisterField BankSelect;
+            public IFlagRegisterField BurstProgramming;
+            public IFlagRegisterField EraseStart;
+            public IFlagRegisterField EndOfOperationInterruptEnable;
+            public IFlagRegisterField ErrorInterruptEnable;
+
+            public int ProgramBufferCount;
+            public long ProgramBufferStart;
+            public bool QuadWordWasErased;
+            public bool QuadWordWasZero;
+            public bool QuadWordIsZero;
+        }
 
         private enum Registers
         {

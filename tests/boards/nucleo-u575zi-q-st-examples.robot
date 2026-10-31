@@ -3,6 +3,7 @@ Documentation       Official STM32CubeU5 v1.9.0 example projects for NUCLEO-U575
 ...                 unmodified ST sources (firmware-tests/cmake/st-examples.cmake), on the board
 ...                 description platforms/boards/nucleo_u575zi_q.repl. The pass criteria are those
 ...                 of the example readme files (LED states).
+Library             Collections
 Resource            ${CURDIR}/../common/stm32u575.resource
 
 *** Variables ***
@@ -36,6 +37,26 @@ Press And Release User Button
     Execute Command                 ${USER_BUTTON} Press
     Execute Command                 emulation RunFor "0.1"
     Execute Command                 ${USER_BUTTON} Release
+
+RNG Example Should Fill Its Array
+    ${led3}=                        Create LED Tester    ${LED3}    defaultTimeout=0
+    Execute Command                 emulation RunFor "0.2"
+    Press And Release User Button
+    Execute Command                 emulation RunFor "0.2"
+    ${address}=                     Execute Command    sysbus GetSymbolAddress "aRandom32bit"
+    ${address}=                     Strip String       ${address}
+    @{numbers}=                     Create List
+    FOR    ${index}    IN RANGE    8
+        ${element}=                 Evaluate           hex(${address} + ${index} * 4)
+        ${value}=                   Execute Command    sysbus ReadDoubleWord ${element}
+        ${value}=                   Strip String       ${value}
+        Should Not Be Equal As Integers    ${value}    0    msg=aRandom32bit[${index}] is 0
+        Append To List              ${numbers}         ${value}
+    END
+    ${distinct}=                    Evaluate           len(set($numbers))
+    Should Be Equal As Integers     ${distinct}        8    msg=repeated numbers: ${numbers}
+    Assert And Hold LED State       false    timeoutAssert=0    timeoutHold=1.2    testerId=${led3}
+    Should Not Be In Log            ${UNMODELLED_ACCESS}    treatAsRegex=true
 
 *** Test Cases ***
 SPI_FullDuplex_ComPolling_Master Should Transfer Through A Loopback
@@ -81,4 +102,25 @@ DMA_FLASHToRAM Should Copy The Flash Buffer To RAM
     ${led3}=                        Create LED Tester    ${LED3}    defaultTimeout=1
     Assert LED Is Blinking          testDuration=2    onDuration=0.25    offDuration=0.25    tolerance=0.2    testerId=${led1}
     Assert LED State                false    timeout=0    testerId=${led3}
+    Should Not Be In Log            ${UNMODELLED_ACCESS}    treatAsRegex=true
+
+RNG_MultiRNG Should Fill The Random Array On A Button Press
+    # HAL_RNG_Init, then each USER button press fills aRandom32bit[8] by polling
+    # (HAL_RNG_GenerateRandomNumber); LED3 toggles on an error.
+    Run ST Example                  st-rng-multirng.elf
+    RNG Example Should Fill Its Array
+
+RNG_MultiRNG_IT Should Fill The Random Array On A Button Press
+    # As RNG_MultiRNG, the numbers read by HAL_RNG_ReadyDataCallback on the RNG interrupt.
+    Run ST Example                  st-rng-multirng-it.elf
+    RNG Example Should Fill Its Array
+
+HASH_HMAC_SHA1MD5 Should Compute The Expected Digests
+    # HMAC-SHA1 and HMAC-MD5 of a text in polling mode, compared with the expected digests.
+    # Success: LED1 (SHA1) and LED2 (MD5) on; mismatch: LED3 on.
+    Run ST Example                  st-hash-hmac-sha1md5.elf
+    Execute Command                 emulation RunFor "0.5"
+    LED State Should Be             ${LED1}    True
+    LED State Should Be             ${LED2}    True
+    LED State Should Be             ${LED3}    False
     Should Not Be In Log            ${UNMODELLED_ACCESS}    treatAsRegex=true

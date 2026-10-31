@@ -83,7 +83,8 @@ Should Have Documented Reset Values
         Port Should Be              ${port}    ${AFRL}       0
         Port Should Be              ${port}    ${AFRH}       0
         Port Should Be              ${port}    ${HSLVR}      0
-        Port Should Be              ${port}    ${SECCFGR}    0x0000FFFF
+        # TZEN = 0: GPIOx_SECCFGR is RAZ/WI (RM0456 section 13.3.18).
+        Port Should Be              ${port}    ${SECCFGR}    0
     END
 
 Should Drive The Output From ODR
@@ -135,7 +136,7 @@ Should Keep The Pin Configuration
     Write Port                      ${GPIOB}    ${HSLVR}      0x00008001
     Write Port                      ${GPIOB}    ${SECCFGR}    0x00000F0F
     Port Should Be                  ${GPIOB}    ${HSLVR}      0x00008001
-    Port Should Be                  ${GPIOB}    ${SECCFGR}    0x00000F0F
+    Port Should Be                  ${GPIOB}    ${SECCFGR}    0
 
 Should Lock The Configuration Of Selected Pins
     [Documentation]                 LCKR write sequence of RM0456 section 13.4.8 locks pin 5.

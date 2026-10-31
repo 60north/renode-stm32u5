@@ -18,8 +18,15 @@
 // All lines of STM32U575 are configurable (RM0456 Table 189). Lines 0-15 come from the GPIO
 // ports; the others are driven through OnGPIO by the peripherals connected to them.
 //
-// Limitations: CPU events (EXTI_EMR1), security and privilege filtering (SECCFGR1, PRIVCFGR1,
-// LOCKR) and wake-up from low-power modes are not modelled; those registers are storage.
+// TrustZone and privilege (RM0456 section 23.5, Table 191): with trustZoneEnabled, the bits and
+// EXTI_EXTICRm fields of the lines set in EXTI_SECCFGR1 read as 0 and ignore writes for
+// non-secure accesses, without an event; EXTI_PRIVCFGR1 does the same for unprivileged
+// accesses. EXTI_SECCFGR1 is written by secure accesses only (a non-secure write is reported to
+// the TZIC), EXTI_PRIVCFGR1 by privileged ones only; EXTI_LOCKR is secure (a non-secure access
+// reads 0 and is reported) and LOCK freezes both configuration registers until reset. With
+// TZEN = 0 EXTI_SECCFGR1 and EXTI_LOCKR are RAZ/WI.
+//
+// Limitations: CPU events (EXTI_EMR1) and wake-up from low-power modes are not modelled.
 //
 
 using System.Collections.Generic;
@@ -29,13 +36,19 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 
 namespace Antmicro.Renode.Peripherals.IRQControllers
 {
     public class STM32U5_EXTI : BasicDoubleWordPeripheral, IKnownSize, ILocalGPIOReceiver, INumberedGPIOOutput, IGPIOReceiver
     {
-        public STM32U5_EXTI(IMachine machine, int numberOfLines = 24) : base(machine)
+        public STM32U5_EXTI(IMachine machine, int numberOfLines = 24, bool trustZoneEnabled = false,
+            STM32U5_GTZC_TZIC illegalAccessController = null) : base(machine)
         {
+            sysbus = machine.GetSystemBus(this);
+            this.trustZoneEnabled = trustZoneEnabled;
+            this.illegalAccessController = illegalAccessController;
             if(numberOfLines < GpioPins || numberOfLines > 32)
             {
                 throw new ConstructionException($"Number of lines must be between {GpioPins} and 32, got {numberOfLines}");
@@ -66,6 +79,29 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             {
                 lineLevel[pin] = SelectedPortLevel(pin);
             }
+        }
+
+        public override uint ReadDoubleWord(long offset)
+        {
+            var denied = DeniedBits(offset, false);
+            return denied == AllBits ? 0 : base.ReadDoubleWord(offset) & ~denied;
+        }
+
+        public override void WriteDoubleWord(long offset, uint value)
+        {
+            var denied = DeniedBits(offset, true);
+            if(denied == AllBits)
+            {
+                return;
+            }
+            if(denied != 0)
+            {
+                // The pending registers clear on written ones and EXTI_SWIER1 triggers on them;
+                // the other registers keep the protected bits.
+                var actOnOnes = offset == (long)Registers.RPR1 || offset == (long)Registers.FPR1 || offset == (long)Registers.SWIER1;
+                value = (value & ~denied) | (actOnOnes ? 0 : base.ReadDoubleWord(offset) & denied);
+            }
+            base.WriteDoubleWord(offset, value);
         }
 
         public long Size => 0x400;
@@ -118,9 +154,9 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
             // RM0456 sections 23.6.6 and 23.6.7.
             Registers.SECCFGR1.Define(this, name: "EXTI_SECCFGR1")
-                .WithValueField(0, numberOfLines, name: "SEC");
+                .WithValueField(0, numberOfLines, out secureLines, name: "SEC");
             Registers.PRIVCFGR1.Define(this, name: "EXTI_PRIVCFGR1")
-                .WithValueField(0, numberOfLines, name: "PRIV");
+                .WithValueField(0, numberOfLines, out privilegedLines, name: "PRIV");
 
             // RM0456 section 23.6.8: four 8-bit fields per register, port code 0x00 = PA ...
             for(var index = 0; index < InterruptSelectionRegisters; index++)
@@ -140,13 +176,105 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
             // RM0456 sections 23.6.9-23.6.11.
             Registers.LOCKR.Define(this, name: "EXTI_LOCKR")
-                .WithFlag(0, name: "LOCK")
+                .WithFlag(0, out configurationLocked, FieldMode.Read | FieldMode.Set, name: "LOCK")
                 .WithReservedBits(1, 31);
             Registers.IMR1.Define(this, name: "EXTI_IMR1")
                 .WithValueField(0, numberOfLines, out interruptMask, name: "IM")
                 .WithChangeCallback((_, __) => UpdateOutputs());
             Registers.EMR1.Define(this, name: "EXTI_EMR1")
                 .WithValueField(0, numberOfLines, name: "EM");
+        }
+
+        // RM0456 section 23.5: the bits of the register at offset denied to the current access.
+        private uint DeniedBits(long offset, bool write)
+        {
+            STM32U5_TrustZoneContext.TryGetTransaction(sysbus, out var secure, out var privileged);
+            secure &= trustZoneEnabled;
+            var secureMask = trustZoneEnabled ? (uint)secureLines.Value : 0;
+            var privilegedMask = (uint)privilegedLines.Value;
+            switch((Registers)offset)
+            {
+            case Registers.SECCFGR1:
+                if(!trustZoneEnabled)
+                {
+                    return AllBits;
+                }
+                if(!write)
+                {
+                    return 0;
+                }
+                if(!secure)
+                {
+                    ReportIllegalAccess(offset, write);
+                    return AllBits;
+                }
+                // SECx of a privileged line is written by privileged accesses only.
+                return configurationLocked.Value ? AllBits : privileged ? 0 : privilegedMask;
+            case Registers.PRIVCFGR1:
+                if(!write)
+                {
+                    return 0;
+                }
+                if(!privileged || configurationLocked.Value)
+                {
+                    return AllBits;
+                }
+                // PRIVx of a secure line is written by secure accesses only.
+                return secure ? 0 : secureMask;
+            case Registers.LOCKR:
+                if(!trustZoneEnabled)
+                {
+                    return AllBits;
+                }
+                if(!secure)
+                {
+                    ReportIllegalAccess(offset, write);
+                    return AllBits;
+                }
+                return 0;
+            }
+            var lineBits = LineBits(offset, secure ? 0 : secureMask);
+            lineBits |= privileged ? 0 : LineBits(offset, privilegedMask);
+            return lineBits;
+        }
+
+        // The bits of the register at offset that belong to the lines in mask.
+        private static uint LineBits(long offset, uint lines)
+        {
+            if(lines == 0)
+            {
+                return 0;
+            }
+            if(offset >= (long)Registers.EXTICR1 && offset <= (long)Registers.EXTICR4)
+            {
+                // Four 8-bit fields, for lines 4m to 4m + 3.
+                var firstLine = (int)(offset - (long)Registers.EXTICR1) / 4 * PinsPerSelectionRegister;
+                var bits = 0u;
+                for(var field = 0; field < PinsPerSelectionRegister; field++)
+                {
+                    bits |= (lines & (1u << (firstLine + field))) != 0 ? 0xFFu << (8 * field) : 0;
+                }
+                return bits;
+            }
+            switch((Registers)offset)
+            {
+            case Registers.RTSR1:
+            case Registers.FTSR1:
+            case Registers.SWIER1:
+            case Registers.RPR1:
+            case Registers.FPR1:
+            case Registers.IMR1:
+            case Registers.EMR1:
+                return lines;
+            default:
+                return 0;
+            }
+        }
+
+        private void ReportIllegalAccess(long offset, bool write)
+        {
+            this.Log(LogLevel.Debug, "Non-secure {0} of {1} denied", write ? "write" : "read", (Registers)offset);
+            illegalAccessController?.ReportIllegalAccess(IllegalAccessRegister, IllegalAccessBit);
         }
 
         private bool SelectedPortLevel(int pin)
@@ -187,6 +315,18 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 Connections[line].Set((active & (1UL << line)) != 0);
             }
         }
+
+        private readonly IBusController sysbus;
+        private readonly bool trustZoneEnabled;
+        private readonly STM32U5_GTZC_TZIC illegalAccessController;
+        private IValueRegisterField secureLines;
+        private IValueRegisterField privilegedLines;
+        private IFlagRegisterField configurationLocked;
+
+        private const uint AllBits = 0xFFFFFFFF;
+        // GTZC2_TZIC_IER2.EXTIIE (stm32u575xx.h GTZC_CFGR2_EXTI_Pos).
+        private const int IllegalAccessRegister = 2;
+        private const int IllegalAccessBit = 6;
 
         private IValueRegisterField risingTrigger;
         private IValueRegisterField fallingTrigger;

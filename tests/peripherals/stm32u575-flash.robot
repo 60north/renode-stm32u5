@@ -10,6 +10,7 @@ ${FLASH_NSKEYR}     0x40022008
 ${FLASH_OPTKEYR}    0x40022010
 ${FLASH_NSSR}       0x40022020
 ${FLASH_NSCR}       0x40022028
+${FLASH_WRP1AR}     0x40022058
 
 ${BANK1}            0x08000000
 ${BANK2}            0x08100000
@@ -94,6 +95,18 @@ Should Unlock Option Bytes Only After The Control Register
     Write Word                      ${FLASH_OPTKEYR}    0x08192A3B
     Write Word                      ${FLASH_OPTKEYR}    0x4C5D6E7F
     Bits Should Be Clear            ${FLASH_NSCR}      ${NSCR_OPTLOCK}
+
+Should Ignore Option Register Writes While OPTLOCK Is Set
+    # RM0456 section 7.9: FLASH_WRP1AR "can not be written if OPTLOCK bit is set"; ST production
+    # value 0xFF80 FFFF.
+    Write Word                      ${FLASH_WRP1AR}    0x00000000
+    Word Should Be                  ${FLASH_WRP1AR}    0xFF80FFFF
+    Unlock Flash
+    Write Word                      ${FLASH_OPTKEYR}    0x08192A3B
+    Write Word                      ${FLASH_OPTKEYR}    0x4C5D6E7F
+    # WRP1A_PSTRT, WRP1A_PEND and UNLOCK become 0; the reserved bits keep their value.
+    Write Word                      ${FLASH_WRP1AR}    0x00000000
+    Word Should Be                  ${FLASH_WRP1AR}    0x7F80FF80
 
 Should Erase Exactly One Page In Bank 1
     ${page2}=                       Evaluate           ${BANK1} + 2 * ${PAGE_SIZE}

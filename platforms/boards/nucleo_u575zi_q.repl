@@ -5,21 +5,4 @@
 // switched on by driving the pin high (BSP_LED_On); BUTTON_USER PC13, configured with a
 // pull-down and read as high when pressed (BSP_PB_Init, BUTTON_PRESSED = 1).
 using "../cpus/stm32u575.repl"
-
-led1: Miscellaneous.LED @ gpioPortC
-
-led2: Miscellaneous.LED @ gpioPortB
-
-led3: Miscellaneous.LED @ gpioPortG
-
-gpioPortC:
-    7 -> led1@0
-
-gpioPortB:
-    7 -> led2@0
-
-gpioPortG:
-    2 -> led3@0
-
-userButton: Miscellaneous.Button @ gpioPortC
-    -> gpioPortC@13
+using "./nucleo_u575zi_q-io.repl"

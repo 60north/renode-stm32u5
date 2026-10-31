@@ -14,22 +14,66 @@
 // Limitations:
 // - Voltage scaling (VOSRDY, ACTVOSRDY) and the EPOD booster (BOOSTRDY) complete immediately.
 // - Low-power modes, wakeup sources, PVD/PVM and supply-ready flags are not modelled.
+// - TrustZone and privilege (RM0456 section 10.8, Table 109): with trustZoneEnabled, the bits of
+//   the functions selected by PWR_SECCFGR, PWR_UCPDR while UCPD1 is secure in the GTZC TZSC,
+//   VOS and BOOSTEN while RCC_SECCFGR.SYSCLKSEC is set, and the PWR_PUCRx/PDCRx bits of the
+//   secure GPIO pins read as 0 and ignore writes for non-secure accesses, without an event. A
+//   non-secure PWR_SECCFGR write is reported to the TZIC; with TZEN = 0 PWR_SECCFGR is RAZ/WI.
+//   PWR_PRIVCFGR SPRIV/NSPRIV apply the same to unprivileged accesses to the secure/non-secure
+//   bits; the status registers and VOSRDY/BOOSTRDY stay readable. The RCC and the GPIO ports
+//   are found by their platform names (sysbus.rcc, sysbus.gpioPortA...).
 //
+
+using System.Collections.Generic;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
+using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.GPIOPort;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
-    public class STM32U5_PWR : BasicDoubleWordPeripheral, IKnownSize
+    public class STM32U5_PWR : BasicDoubleWordPeripheral, IKnownSize, ISTM32U5_TrustZoneAware
     {
-        public STM32U5_PWR(IMachine machine) : base(machine)
+        public STM32U5_PWR(IMachine machine, bool trustZoneEnabled = false, STM32U5_GTZC_TZIC illegalAccessController = null,
+            STM32U5_GTZC_TZSC tzsc1 = null) : base(machine)
         {
+            sysbus = machine.GetSystemBus(this);
+            this.trustZoneEnabled = trustZoneEnabled;
+            this.illegalAccessController = illegalAccessController;
+            this.tzsc1 = tzsc1;
             DefineRegisters();
             Reset();
         }
 
+        public override uint ReadDoubleWord(long offset)
+        {
+            var denied = DeniedBits(offset, false);
+            return denied == AllBits ? 0 : base.ReadDoubleWord(offset) & ~denied;
+        }
+
+        public override void WriteDoubleWord(long offset, uint value)
+        {
+            var denied = DeniedBits(offset, true);
+            if(denied == AllBits)
+            {
+                return;
+            }
+            if(denied != 0)
+            {
+                // CSSF and CWUFx clear on written ones; the other bits keep their value.
+                var clearOnWrite = offset == (long)Registers.SR || offset == (long)Registers.WUSCR;
+                value = (value & ~denied) | (clearOnWrite ? 0 : base.ReadDoubleWord(offset) & denied);
+            }
+            base.WriteDoubleWord(offset, value);
+        }
+
         public long Size => 0x400;
+
+        // RM0456 section 10.8.1: the PWR clock and reset bits of the RCC are secure as soon as one
+        // PWR function is secure.
+        public bool HasSecureFunction => trustZoneEnabled && base.ReadDoubleWord((long)Registers.SECCFGR) != 0;
 
         // Used by STM32U5_RCC to protect RCC_BDCR.
         public bool BackupDomainWriteEnabled => backupDomainWriteEnable.Value;
@@ -205,8 +249,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             // RM p.461, reset 0x00000000
             Registers.PRIVCFGR.Define(this, 0x00000000, name: "PWR_PRIVCFGR")
-                .WithFlag(0, name: "SPRIV")
-                .WithFlag(1, name: "NSPRIV")
+                .WithFlag(0, out securePrivileged, name: "SPRIV")
+                .WithFlag(1, out nonSecurePrivileged, name: "NSPRIV")
                 .WithReservedBits(2, 30)
             ;
 
@@ -639,6 +683,164 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 .WithReservedBits(8, 24)
             ;
         }
+
+        // RM0456 section 10.8: the bits of the register at offset denied to the current access.
+        private uint DeniedBits(long offset, bool write)
+        {
+            STM32U5_TrustZoneContext.TryGetTransaction(sysbus, out var secure, out var privileged);
+            secure &= trustZoneEnabled;
+            if(offset == (long)Registers.SECCFGR)
+            {
+                if(!trustZoneEnabled)
+                {
+                    return AllBits;
+                }
+                if(!write)
+                {
+                    return 0;
+                }
+                if(!secure)
+                {
+                    this.Log(LogLevel.Debug, "Non-secure write of PWR_SECCFGR denied");
+                    illegalAccessController?.ReportIllegalAccess(IllegalAccessRegister, IllegalAccessBit);
+                    return AllBits;
+                }
+                return !privileged && securePrivileged.Value ? AllBits : 0;
+            }
+            if(offset == (long)Registers.PRIVCFGR)
+            {
+                if(!write)
+                {
+                    return 0;
+                }
+                // Written by privileged accesses only; SPRIV by secure ones only.
+                return !privileged ? AllBits : secure ? 0 : SecurePrivilegeBit;
+            }
+            var secureBits = trustZoneEnabled ? SecureBits(offset) : 0;
+            var denied = secure ? 0 : secureBits;
+            if(!privileged)
+            {
+                denied |= securePrivileged.Value ? secureBits : 0;
+                if(nonSecurePrivileged.Value)
+                {
+                    denied |= ~secureBits & ~(write ? 0 : UnprivilegedReadableBits(offset));
+                }
+            }
+            return denied;
+        }
+
+        // RM0456 Table 109.
+        private uint SecureBits(long offset)
+        {
+            var configuration = base.ReadDoubleWord((long)Registers.SECCFGR);
+            var lowPower = (configuration & LowPowerModeProtection) != 0;
+            var wakeupPins = configuration & WakeupPinProtections;
+            switch((Registers)offset)
+            {
+            case Registers.CR1:
+            case Registers.CR2:
+                return lowPower ? AllBits : 0;
+            case Registers.SR:
+                return lowPower ? ClearStopStandbyFlagBit : 0;
+            case Registers.CR3:
+            case Registers.SVMCR:
+                return (configuration & VoltageDetectionProtection) != 0 ? AllBits : 0;
+            case Registers.BDCR1:
+            case Registers.BDCR2:
+            case Registers.DBPR:
+                return (configuration & BackupDomainProtection) != 0 ? AllBits : 0;
+            case Registers.APCR:
+                return (configuration & PullConfigurationProtection) != 0 ? AllBits : 0;
+            case Registers.WUCR1:
+            case Registers.WUCR2:
+            case Registers.WUSCR:
+                return wakeupPins;
+            case Registers.WUCR3:
+            {
+                // WUSELx: two bits per pin.
+                var bits = 0u;
+                for(var pin = 0; pin < 8; pin++)
+                {
+                    bits |= (wakeupPins & (1u << pin)) != 0 ? 3u << (2 * pin) : 0;
+                }
+                return bits;
+            }
+            case Registers.UCPDR:
+                return tzsc1 != null && tzsc1.IsSecure(UcpdConfigurationRegister, UcpdBit) ? AllBits : 0;
+            case Registers.VOSR:
+                return TryGetPeripheral<STM32U5_RCC>("rcc", out var rcc) && rcc.SystemClockSecure ? VoltageScalingBits : 0;
+            }
+            if(offset >= (long)Registers.PUCRA && offset <= (long)Registers.PDCRI)
+            {
+                // PWR_PUCRx at 0x50 + 8 * x, PWR_PDCRx at 0x54 + 8 * x: one bit per pin.
+                var port = (char)('A' + (offset - (long)Registers.PUCRA) / 8);
+                return TryGetPeripheral<STM32U5_GPIOPort>("gpioPort" + port, out var gpio) ? gpio.SecurePins : 0;
+            }
+            return 0;
+        }
+
+        // NSPRIV: the status registers and VOSRDY/BOOSTRDY stay readable by unprivileged accesses.
+        private static uint UnprivilegedReadableBits(long offset)
+        {
+            switch((Registers)offset)
+            {
+            case Registers.SR:
+            case Registers.SVMSR:
+            case Registers.BDSR:
+            case Registers.WUSR:
+                return AllBits;
+            case Registers.VOSR:
+                return VoltageScalingReadyBits;
+            default:
+                return 0;
+            }
+        }
+
+        // Peripherals are found by their platform name (sysbus.<name>) on first use; a missing
+        // peripheral is looked up again later.
+        private bool TryGetPeripheral<T>(string name, out T peripheral) where T : class, IPeripheral
+        {
+            if(peripherals.TryGetValue(name, out var found))
+            {
+                peripheral = found as T;
+                return peripheral != null;
+            }
+            if(!machine.TryGetByName<IPeripheral>("sysbus." + name, out found))
+            {
+                peripheral = null;
+                return false;
+            }
+            peripherals[name] = found;
+            peripheral = found as T;
+            return peripheral != null;
+        }
+
+        private readonly IBusController sysbus;
+        private readonly bool trustZoneEnabled;
+        private readonly STM32U5_GTZC_TZIC illegalAccessController;
+        private readonly STM32U5_GTZC_TZSC tzsc1;
+        private readonly Dictionary<string, IPeripheral> peripherals = new Dictionary<string, IPeripheral>();
+        private IFlagRegisterField securePrivileged;
+        private IFlagRegisterField nonSecurePrivileged;
+
+        private const uint AllBits = 0xFFFFFFFF;
+        private const uint SecurePrivilegeBit = 1u << 0;
+        // PWR_SECCFGR (stm32u575xx.h PWR_SECCFGR_*_Pos).
+        private const uint WakeupPinProtections = 0xFF;
+        private const uint LowPowerModeProtection = 1u << 12;
+        private const uint VoltageDetectionProtection = 1u << 13;
+        private const uint BackupDomainProtection = 1u << 14;
+        private const uint PullConfigurationProtection = 1u << 15;
+        private const uint ClearStopStandbyFlagBit = 1u << 0;
+        // PWR_VOSR: VOS[1:0] and BOOSTEN; BOOSTRDY and VOSRDY.
+        private const uint VoltageScalingBits = 0x7u << 16;
+        private const uint VoltageScalingReadyBits = 0x3u << 14;
+        // GTZC1 TZSC SECCFGR1.UCPD1 (stm32u575xx.h GTZC_CFGR1_UCPD1_Pos).
+        private const int UcpdConfigurationRegister = 1;
+        private const int UcpdBit = 19;
+        // GTZC2_TZIC_IER2.PWRIE (stm32u575xx.h GTZC_CFGR2_PWR_Pos).
+        private const int IllegalAccessRegister = 2;
+        private const int IllegalAccessBit = 3;
 
         private IFlagRegisterField regulatorSelection;
         private IFlagRegisterField boosterEnable;

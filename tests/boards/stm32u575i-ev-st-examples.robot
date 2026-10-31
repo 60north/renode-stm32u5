@@ -31,3 +31,18 @@ FDCAN_Loopback Should Receive Its Own Frames
     Assert LED Is Blinking          testDuration=1    onDuration=0.1    offDuration=0.1    tolerance=0.2    testerId=${led5}
     Assert LED State                false    timeout=0    testerId=${led6}
     Should Not Be In Log            ${UNMODELLED_ACCESS}    treatAsRegex=true
+
+SD_ReadWrite_DMALinkedList Should Read Back What It Wrote
+    # SDMMC1 with a 64 MB card: erase, then 24 MB written and read back through a circular
+    # two-node IDMA linked list of 1 KB buffers refilled by the CPU. Success: LED5 toggles every
+    # 200 ms; error: LED6 toggles. The transfer takes about 4.3 s of virtual time.
+    Create STM32U575 Machine        ${BOARD}
+    Execute Command                 machine LoadPlatformDescriptionFromString "sdcard: SD.STM32U5_SDCard @ sdmmc1 { capacity: 0x4000000 }"
+    Create Log Tester               0
+    Execute Command                 sysbus LoadELF @${FIRMWARE}/st-sd-readwrite-dma-linkedlist.elf
+    ${led5}=                        Create LED Tester    ${LED5}    defaultTimeout=6
+    ${led6}=                        Create LED Tester    ${LED6}    defaultTimeout=6
+    Assert LED State                true    testerId=${led5}
+    Assert LED Is Blinking          testDuration=1    onDuration=0.2    offDuration=0.2    tolerance=0.2    testerId=${led5}
+    Assert LED State                false    timeout=0    testerId=${led6}
+    Should Not Be In Log            ${UNMODELLED_ACCESS}    treatAsRegex=true

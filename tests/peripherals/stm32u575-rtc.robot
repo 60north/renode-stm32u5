@@ -49,3 +49,15 @@ Should Keep The Backup Domain Over A System Reset
     # Locked again: INIT is ignored without the key, INITF stays 0.
     Write Word                      ${RTC} + 0x0C      0x80
     Bits Should Be Clear            ${RTC} + 0x0C      0x40
+
+Should Not Restart The Wake-Up Timer When RTC_CR Is Written Again
+    # RM0456 63.6.8: WUTE enables the wake-up timer, writing it again with 1 does not restart
+    # the counter. RTC/16 (WUCKSEL = 0) = 2048 Hz, WUT = 2047: one wake-up per second.
+    Write Word                      ${RTC} + 0x14      2047
+    # WUTIE and WUTE.
+    Write Word                      ${RTC} + 0x18      0x4400
+    Execute Command                 emulation RunFor "0.6"
+    Write Word                      ${RTC} + 0x18      0x4400
+    Execute Command                 emulation RunFor "0.5"
+    # RTC_SR.WUTF at 1 s, not 0.6 s + 1 s.
+    Bits Should Be Set              ${RTC} + 0x50      0x4

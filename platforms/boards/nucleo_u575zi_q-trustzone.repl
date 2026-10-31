@@ -1,0 +1,11 @@
+// NUCLEO-U575ZI-Q with TrustZone enabled (TZEN = 1): the STM32U575 TrustZone platform and the
+// board's components.
+using "../cpus/stm32u575-trustzone.repl"
+using "./nucleo_u575zi_q-io.repl"
+
+// User option bytes of the STM32CubeU5 v1.9.0 TrustZone projects for this board (for example
+// Examples/FLASH/FLASH_EraseProgram_TrustZone/README.md): SECWM1_PSTRT = 0, SECWM1_PEND = 0x7F
+// (bank 1 secure), SECWM2_PSTRT = 1, SECWM2_PEND = 0 (no secure page in bank 2).
+flashController:
+    secureWatermark1: 0xFFFFFF80
+    secureWatermark2: 0xFF80FF81
