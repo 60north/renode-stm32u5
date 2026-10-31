@@ -120,37 +120,55 @@ exchange frames through a CAN hub (`emulation CreateCANHub "can"`,
 
 ## Not modelled
 
-Peripherals: ADC4, DAC1, COMP1/2, OPAMP1/2, VREFBUF, LPTIM1-4, WWDG, SAI1/2, MDF1, ADF1,
-DCMI, PSSI, DMA2D, CRC, CORDIC, FMAC, USB OTG FS, UCPD1, CRS, TSC, RAMCFG. Accesses to them are
-logged as accesses to non-existing peripherals.
+### Peripherals
 
-Behaviour of the modelled peripherals:
+ADC4, DAC1, COMP1/2, OPAMP1/2, VREFBUF, LPTIM1-4, WWDG, SAI1/2, MDF1, ADF1, DCMI, PSSI, DMA2D,
+CRC, CORDIC, FMAC, USB OTG FS, UCPD1, CRS, TSC and RAMCFG have no model. Firmware that accesses
+them gets a "non-existing peripheral" warning in the log.
 
-- Low-power modes. Timing of oscillators, PLLs, voltage scaling and flash erase: they complete
-  at once. SysTick always counts HCLK; the DWT cycle counter runs at the reset clock.
-- Analog behaviour and error conditions of the communication peripherals: USART overrun and
-  reception errors, SPI slave mode and CRC, I2C bus timing and errors, CAN arbitration,
-  acknowledgement and bus errors, SD card CRC and timeouts. FDCAN frames take their time at the
-  nominal bit rate; SDMMC buffers the time of their bytes on the bus.
-- GPDMA 2D addressing, triggers, bursts and transmit requests; timer DMA requests; HASH and
-  OCTOSPI DMA; OCTOSPI DTR, DQS, HyperBus and wrap modes; RTC shadow registers, timestamp and
-  tamper detection; IWDG early wake-up. Timer break, dead-time and encoder modes are not tested.
-- The routing of LPGPIO1 to pins (a board connects its outputs) and the inherited LPGPIO
-  security; the effect of the SYSCFG CPU and class B locks.
-- Flash option byte changes, ECC and write protection. Flash contents survive a machine reset,
-  not a restart of Renode.
-- TrustZone: TZEN is fixed by the platform. Execute accesses are checked as data accesses;
-  accesses without a CPU or DMA context (Monitor, ELF loading) pass the firewalls; SDMMC
-  internal DMA transfers do not carry the SDMMC security.
+### Limitations of the modelled peripherals
+
+- **Power and clocks.** Low-power modes are not modelled. Oscillators, PLLs and voltage scaling
+  become ready immediately. SysTick always counts HCLK. The DWT cycle counter runs at the reset
+  clock frequency.
+- **Communication.** Error conditions are not simulated: no USART overrun or reception errors,
+  no SPI CRC, no I2C bus errors, no CAN arbitration, acknowledgement or bus errors, no SD card
+  CRC errors or timeouts. SPI works in master mode only. FDCAN frames and SDMMC data take their
+  transmission time on the bus; other transfers complete immediately.
+- **DMA.** GPDMA has no 2D addressing, triggers, bursts or transmit requests. Timers, HASH and
+  OCTOSPI have no DMA requests.
+- **OCTOSPI.** Only single and multi-line SDR transfers; no DTR, DQS, HyperBus or wrap mode.
+- **Timers, RTC and watchdog.** The RTC has no shadow registers, timestamp or tamper detection;
+  the IWDG has no early wake-up interrupt. Timer break, dead-time and encoder modes are not
+  tested.
+- **LPGPIO1.** Its I/Os are not routed to the GPIO pins: a board description connects them. It
+  does not inherit the GPIO pin security.
+- **SYSCFG.** The CPU register locks and the class B locks are stored but have no effect.
+- **Flash.** Erase completes immediately. Option bytes cannot be changed at run time; ECC and
+  write protection are not modelled. The flash contents survive a machine reset, but not a
+  restart of Renode.
+- **TrustZone.** TZEN is fixed by the platform description. Instruction fetches are checked like
+  data accesses. Accesses without a CPU or DMA context, such as Monitor commands and ELF loading,
+  pass the firewalls. SDMMC internal DMA transfers do not carry the SDMMC security attribute.
 
 ## TrustZone platform speed
 
-`stm32u575-trustzone.repl` runs slower than `stm32u575.repl` in host time: the MPCBB firewall
-checks every SRAM access, so the SRAMs are `ArrayMemory` behind the firewall instead of
-`MappedMemory`. Emulated time is not affected. Firmware that waits in loops (`HAL_Delay`, flag
-polling) suffers most; lowering the instruction rate with `cpu PerformanceInMips 10` makes those
-loops run fewer iterations for the same delay (timers and peripheral timing do not change). The
-ST TrustZone tests run at 10 MIPS.
+For emulating TrustZone firmware, remember that `stm32u575-trustzone.repl` is much slower in
+host time than `stm32u575.repl`. The GTZC block-based firewall (MPCBB) has to check every SRAM
+access, so the TrustZone platform uses `ArrayMemory` behind the firewall instead of the faster
+`MappedMemory`. Emulated time is not affected, only the time it takes on your computer.
+
+Firmware that waits in loops, for example in `HAL_Delay` or while polling a flag, is affected
+most. To speed it up, lower the instruction rate:
+
+```text
+cpu PerformanceInMips 10
+```
+
+Renode advances emulated time by the number of executed instructions, so a wait loop then runs
+fewer iterations for the same delay. Timers, SysTick, the RTC and peripheral timing do not
+change. Do not do this if the firmware must finish heavy computation within a time window. The
+ST TrustZone tests in this repository run at 10 MIPS.
 
 ## Running the tests
 
