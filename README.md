@@ -6,15 +6,30 @@ Platform descriptions, peripheral models and tests for running STM32U575 firmwar
 ## What is modelled
 
 Every STM32U575 peripheral is modelled except the ones listed under
-[Not modelled](#not-modelled): the Cortex-M33 core with the NVIC, SysTick and DWT; flash,
-SRAM1-4 and BKPSRAM; RCC, PWR, flash interface, SYSCFG, ICACHE, DCACHE1, DBGMCU; GPIO ports A-I,
-LPGPIO1, EXTI; GPDMA1 and LPDMA1; USART1-3, UART4/5, LPUART1; SPI1-3; I2C1-4; FDCAN1; OCTOSPI1/2
-with OCTOSPIM; SDMMC1/2 with an SD card; FMC; timers TIM1-8 and TIM15-17; RTC and TAMP; IWDG;
-ADC1; RNG; HASH. With TZEN = 1: the IDAU, secure aliases of memories and peripherals, the GTZC
-(TZSC firewall of the securable peripherals, TZIC, MPCBB1-4 for the SRAMs, MPCWM1-5 with
-BKPSRAM behind MPCWM4) and the secure registers of the TrustZone-aware peripherals (RCC, PWR,
-GPIO, EXTI, FLASH, GPDMA, RTC, TAMP, SYSCFG). Each model file names the Renode model it was
-adapted from and what it does not model.
+[Not modelled](#not-modelled).
+
+| Area | Modelled |
+| --- | --- |
+| Core | Cortex-M33, NVIC, SysTick, DWT |
+| Memories | flash, SRAM1-4, BKPSRAM |
+| System | RCC, PWR, flash interface, SYSCFG, ICACHE, DCACHE1, DBGMCU |
+| I/O | GPIO ports A-I, LPGPIO1, EXTI |
+| DMA | GPDMA1, LPDMA1 |
+| Communication | USART1-3, UART4/5, LPUART1, SPI1-3, I2C1-4, FDCAN1 |
+| Storage | OCTOSPI1/2 with OCTOSPIM, SDMMC1/2 with an SD card, FMC |
+| Timers | TIM1-8, TIM15-17, RTC with TAMP, IWDG |
+| Analog | ADC1 |
+| Security | RNG, HASH |
+
+With TrustZone enabled (TZEN = 1):
+
+- the IDAU and the secure aliases of memories and peripherals;
+- the GTZC: TZSC firewall of the securable peripherals, TZIC, MPCBB1-4 for the SRAMs, MPCWM1-5
+  (BKPSRAM behind MPCWM4);
+- the secure registers of the TrustZone-aware peripherals: RCC, PWR, GPIO, EXTI, FLASH, GPDMA,
+  RTC, TAMP, SYSCFG.
+
+Each model file names the Renode model it was adapted from and what it does not model.
 
 The tests run unmodified STM32CubeU5 HAL firmware and official STM32CubeU5 example projects,
 among them SD_ReadWrite_DMALinkedList (SDMMC with the internal DMA), HASH_HMAC_SHA1MD5, RNG,
